@@ -1,0 +1,127 @@
+collider: LHC # options so far: are LEP and LHC
+
+SetupNN:
+  model_name: TESTNEWSETUP_withweights_July24
+  reload: False # load existing model if True, otherwise train new model
+  reload_scheduler: False # whether to reload the scheduler state when reloading a model
+  n_epochs: 25
+  hyperparams:  { # for NuFlow with transformer conditioning
+              'batch_size': 4096,
+              'num_layers': 9,
+              'num_bins': 20,
+              'tail_bound': 4.0,
+              'hidden_size': 256,
+              'num_blocks': 1,
+              'lr': 0.0005,
+              'context_dim': 64,
+              'd_model': 256,
+              'nhead': 2,
+              'num_transformer_layers': 4,
+              'dropout': 0.0}
+  MLP_hyperparams: { # for MLP baseline
+              'batch_size': 8192,
+              'num_blocks': 6,
+              'hidden_size': 512,
+              'lr': 0.0005}
+  use_transformer: True
+  map_method: gradient
+  map_num_draws: 100
+
+
+Data:
+  datasets: ['ppToHToTauTau_AllDM_UnCorr_Jul20']  # name of dataset to use, has to be one of the keys in the available_files dictionary below
+  output_dir: 'prepared_data'  # directory where the prepared datasets will be stored
+  use_reco: True # whether to use reco-level input features - this changes the cuts applied in the data processing and the visible tau vector used for the onorm basis
+  # test_dataset:  ['prepared_LHC_data_fortesting/ppToHToTauTau_AllDM_CPEven_May22_ext6_fixedgen/test_dataframe__leptonic_mode_0_transformer_incFastMTT.parquet', 'prepared_LHC_data_fortesting/ppToHToTauTau_AllDM_CPOdd_May22_ext6_fixedgen/test_dataframe__leptonic_mode_0_transformer_incFastMTT.parquet', 'prepared_LHC_data_fortesting/ppToHToTauTau_AllDM_CPMix_May22_fixedgen/test_dataframe__leptonic_mode_0_transformer_incFastMTT.parquet', 'prepared_LHC_data_fortesting/ppToZToTauTau_AllDM_May22_fixedgen/test_dataframe__leptonic_mode_0_transformer_incFastMTT.parquet', 'prepared_LHC_data_fortesting/ppToZPrimeToTauTau_AllDM_May22_fixedgen/test_dataframe__leptonic_mode_0_transformer_incFastMTT.parquet', 'prepared_LHC_data_fortesting/ppToHToTauTau_AllDM_CPEven_FromLHE_no_entanglement_May22/test_dataframe__leptonic_mode_0_transformer.parquet']
+  # test_output_name: ['output_results_CPEven', 'output_results_CPOdd', 'output_results_CPMix', 'output_results_Z', 'output_results_Zprime', 'output_results_noentanglement']
+  leptonic_mode: 0 # 0 means only hadronic taus, 1 means 1 leptonic tau and 1 hadronic, 2 means both leptonic, -1 means no selection based on whether tau is leptonic is applied
+  tree_name: 'tree'  # name of the tree in the root file
+  inc_reco_taus: False
+  coordinates: onorm  # options: standard, polar, onorm
+  training_weight_columns: ['tauspinner_wt_alpha0', 'tauspinner_wt_alpha90']
+  train_fraction: 0.85  # fraction of the dataset to use for training
+  val_fraction: 0.10 # fraction of the dataset to use for validation
+  test_fraction: 0.05 # fraction of the dataset to use for testing
+  full_dataframe_testing: False # if True will use full dataset for testing
+  Features:
+    dataframe_variables: [
+                    'taup_npi', 'taup_npizero', 'taup_nmu', 'taup_nele',
+                    'taun_npi', 'taun_npizero', 'taun_nmu', 'taun_nele',
+                    'met_px', 'met_py',
+                    'taup_pi1_px', 'taup_pi1_py', 'taup_pi1_pz', 'taup_pi1_e',
+                    'taup_pi1_ipx', 'taup_pi1_ipy', 'taup_pi1_ipz',
+                    'taun_pi1_px', 'taun_pi1_py', 'taun_pi1_pz', 'taun_pi1_e',
+                    'taun_pi1_ipx', 'taun_pi1_ipy', 'taun_pi1_ipz',
+                    'taup_pi2_px', 'taup_pi2_py', 'taup_pi2_pz', 'taup_pi2_e',
+                    'taun_pi2_px', 'taun_pi2_py', 'taun_pi2_pz', 'taun_pi2_e',
+                    'taup_pi3_px', 'taup_pi3_py', 'taup_pi3_pz', 'taup_pi3_e',
+                    'taun_pi3_px', 'taun_pi3_py', 'taun_pi3_pz', 'taun_pi3_e',
+                    'taup_lep_px', 'taup_lep_py', 'taup_lep_pz', 'taup_lep_e',
+                    'taup_lep_ipx', 'taup_lep_ipy', 'taup_lep_ipz',
+                    'taun_lep_px', 'taun_lep_py', 'taun_lep_pz', 'taun_lep_e',
+                    'taun_lep_ipx', 'taun_lep_ipy', 'taun_lep_ipz',
+                    'taup_pizero1_px', 'taup_pizero1_py', 'taup_pizero1_pz', 'taup_pizero1_e',
+                    'taun_pizero1_px', 'taun_pizero1_py', 'taun_pizero1_pz', 'taun_pizero1_e',
+                    'taup_charged_px', 'taup_charged_py', 'taup_charged_pz', 'taup_charged_e',
+                    'taun_charged_px', 'taun_charged_py', 'taun_charged_pz', 'taun_charged_e',
+                    'taup_charged_ipx', 'taup_charged_ipy', 'taup_charged_ipz',
+                    'taun_charged_ipx', 'taun_charged_ipy', 'taun_charged_ipz',
+                    'taup_sv_x', 'taup_sv_y', 'taup_sv_z',
+                    'taun_sv_x', 'taun_sv_y', 'taun_sv_z',
+                    'taup_vis_pT', 'taun_vis_pT',
+                    'reco_taup_npi', 'reco_taup_npizero', 'reco_taup_nmu', 'reco_taup_nele',
+                    'reco_taun_npi', 'reco_taun_npizero', 'reco_taun_nmu', 'reco_taun_nele',
+                    'reco_met_px', 'reco_met_py',
+                    'reco_taup_pi1_px', 'reco_taup_pi1_py', 'reco_taup_pi1_pz', 'reco_taup_pi1_e',
+                    'reco_taup_pi1_ipx', 'reco_taup_pi1_ipy', 'reco_taup_pi1_ipz',
+                    'reco_taun_pi1_px', 'reco_taun_pi1_py', 'reco_taun_pi1_pz', 'reco_taun_pi1_e',
+                    'reco_taun_pi1_ipx', 'reco_taun_pi1_ipy', 'reco_taun_pi1_ipz',
+                    'reco_taup_pi2_px', 'reco_taup_pi2_py', 'reco_taup_pi2_pz', 'reco_taup_pi2_e',
+                    'reco_taun_pi2_px', 'reco_taun_pi2_py', 'reco_taun_pi2_pz', 'reco_taun_pi2_e',
+                    'reco_taup_pi3_px', 'reco_taup_pi3_py', 'reco_taup_pi3_pz', 'reco_taup_pi3_e',
+                    'reco_taun_pi3_px', 'reco_taun_pi3_py', 'reco_taun_pi3_pz', 'reco_taun_pi3_e',
+                    'reco_taup_lep_px', 'reco_taup_lep_py', 'reco_taup_lep_pz', 'reco_taup_lep_e',
+                    'reco_taup_lep_ipx', 'reco_taup_lep_ipy', 'reco_taup_lep_ipz',
+                    'reco_taun_lep_px', 'reco_taun_lep_py', 'reco_taun_lep_pz', 'reco_taun_lep_e',
+                    'reco_taun_lep_ipx', 'reco_taun_lep_ipy', 'reco_taun_lep_ipz',
+                    'reco_taup_pizero1_px', 'reco_taup_pizero1_py', 'reco_taup_pizero1_pz', 'reco_taup_pizero1_e',
+                    'reco_taun_pizero1_px', 'reco_taun_pizero1_py', 'reco_taun_pizero1_pz', 'reco_taun_pizero1_e',
+                    'reco_taup_charged_px', 'reco_taup_charged_py', 'reco_taup_charged_pz', 'reco_taup_charged_e',
+                    'reco_taun_charged_px', 'reco_taun_charged_py', 'reco_taun_charged_pz', 'reco_taun_charged_e',
+                    'reco_taup_charged_ipx', 'reco_taup_charged_ipy', 'reco_taup_charged_ipz',
+                    'reco_taun_charged_ipx', 'reco_taun_charged_ipy', 'reco_taun_charged_ipz',
+                    'reco_taup_sv_x', 'reco_taup_sv_y', 'reco_taup_sv_z',
+                    'reco_taun_sv_x', 'reco_taun_sv_y', 'reco_taun_sv_z',
+                    'reco_taup_vis_pT', 'reco_taun_vis_pT',
+                    'taup_nu_px', 'taup_nu_py', 'taup_nu_pz', 'taup_nu_m',
+                    'taun_nu_px', 'taun_nu_py', 'taun_nu_pz', 'taun_nu_m',
+                ]
+    input_features: [
+                    'reco_taup_haspizero', 'reco_taun_haspizero',
+                    'reco_taup_npizero', 'reco_taun_npizero',
+                    'reco_taup_is3prong', 'reco_taun_is3prong',
+                    'reco_met_px', 'reco_met_py',
+                    'reco_taup_charged_ipx', 'reco_taup_charged_ipy', 'reco_taup_charged_ipz',
+                    'reco_taun_charged_ipx', 'reco_taun_charged_ipy', 'reco_taun_charged_ipz',
+                    'reco_taup_pi1_px', 'reco_taup_pi1_py', 'reco_taup_pi1_pz', 'reco_taup_pi1_e',
+                    'reco_taun_pi1_px', 'reco_taun_pi1_py', 'reco_taun_pi1_pz', 'reco_taun_pi1_e',
+                    'reco_taup_pi2_px', 'reco_taup_pi2_py', 'reco_taup_pi2_pz', 'reco_taup_pi2_e',
+                    'reco_taun_pi2_px', 'reco_taun_pi2_py', 'reco_taun_pi2_pz', 'reco_taun_pi2_e',
+                    'reco_taup_pi3_px', 'reco_taup_pi3_py', 'reco_taup_pi3_pz', 'reco_taup_pi3_e',
+                    'reco_taun_pi3_px', 'reco_taun_pi3_py', 'reco_taun_pi3_pz', 'reco_taun_pi3_e',
+                    'reco_taup_sv_x', 'reco_taup_sv_y', 'reco_taup_sv_z',
+                    'reco_taun_sv_x', 'reco_taun_sv_y', 'reco_taun_sv_z',
+                    'reco_taup_pizero1_px', 'reco_taup_pizero1_py', 'reco_taup_pizero1_pz', 'reco_taup_pizero1_e',
+                    'reco_taun_pizero1_px', 'reco_taun_pizero1_py', 'reco_taun_pizero1_pz', 'reco_taun_pizero1_e',
+                  ]
+    output_features: {'standard': ['taup_nu_px', 'taup_nu_py', 'taup_nu_pz','taun_nu_px', 'taun_nu_py', 'taun_nu_pz'],
+                      'polar':['taup_nu_p_pt', 'taup_nu_p_eta', 'taup_nu_p_phi','taun_nu_p_pt', 'taun_nu_p_eta', 'taun_nu_p_phi'],
+                      'onorm': ['taup_nu_n', 'taup_nu_r', 'taup_nu_k','taun_nu_n', 'taun_nu_r', 'taun_nu_k']}
+  available_files: {
+    'ppToHToTauTau_AllDM_UnCorr_Jul20': '/vols/cms/dw515/DiTauEntanglement_new/DiTauEntanglement/ppToHToTauTau_AllDM_UnCorr_Jul20/reco_events.root',
+    'ppToHToTauTau_AllDM_UnCorr_Jul20_ext1_large': '/vols/cms/dw515/DiTauEntanglement_new/DiTauEntanglement/ppToHToTauTau_AllDM_UnCorr_Jul20_ext1_large/reco_events.root',
+    'ppToHToTauTau_AllDM_UnCorr_Jul20_ext2_large': '/vols/cms/dw515/DiTauEntanglement_new/DiTauEntanglement/ppToHToTauTau_AllDM_UnCorr_Jul20_ext2_large/reco_events.root',
+    'ppToHToTauTau_DM0and1_UnCorr_Jun25_large': '/vols/cms/dw515/DiTauEntanglement_new/DiTauEntanglement/ppToHToTauTau_DM0and1_UnCorr_Jun25_large/reco_events.root',
+    'ppToZToTauTau_AllDM_Jul20': '/vols/cms/dw515/DiTauEntanglement_new/DiTauEntanglement/ppToZToTauTau_AllDM_Jul20/reco_events.root',
+  }
+
