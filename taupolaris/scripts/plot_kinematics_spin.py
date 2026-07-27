@@ -92,10 +92,18 @@ derived_vars = {
 m_tau = 1.77686
 m_boson = 125.0
 
-truth_color = '#C9B583'
-pred_color = '#0072B2'
-sampled_color = '#CC3311'
+truth_color = "#FFDBBB" # '#C9B583'
+sampled_color = '#0072B2'
+pred_color = "#e42536" #'#CC3311'
 transformer_color = '#2CA02C'
+truth_line_color = '#CC5801'
+
+
+# more purple style
+# truth_color = "#C8BCC3"
+# sampled_color = "#0E8BD3" # "#BA2D0B"
+# transformer_color = "#50A733"
+
 
 
 def replace_failed_map(df, threshold=1.0):
@@ -195,18 +203,23 @@ def _delta_r(px1, py1, pz1, px2, py2, pz2):
 
 
 angle_vars = {
-    "opening_angle": r"$\Delta\theta(\tau^+,\tau^-)$ [rad]",
-    "dR":            r"$\Delta R(\tau^+,\tau^-)$",
-    "nu_nubar_deta": r"$\Delta\eta(\nu,\bar{\nu})$",
-    "nu_nubar_dphi": r"$\Delta\phi(\nu,\bar{\nu})$",
-    "nu_nubar_dR":   r"$\Delta R(\nu,\bar{\nu})$",
+    "opening_angle":       r"$\Delta\theta(\tau^+,\tau^-)$ [rad]",
+    "dR":                  r"$\Delta R(\tau^+,\tau^-)$",
+    "nu_nubar_deta":       r"$\Delta\eta(\nu,\bar{\nu})$",
+    "nu_nubar_dphi":       r"$\Delta\phi(\nu,\bar{\nu})$",
+    "nu_nubar_dR":         r"$\Delta R(\nu,\bar{\nu})$",
+    "nu_taum_dphi":        r"$\Delta\phi(\nu,\tau^-)$",
+    "nu_taum_dR":          r"$\Delta R(\nu,\tau^-)$",
+    "nubar_taup_dphi":     r"$\Delta\phi(\bar{\nu},\tau^+)$",
+    "nubar_taup_dR":       r"$\Delta R(\bar{\nu},\tau^+)$",
 }
 
 
 def add_angle_cols(df):
-    """Add the opening angle and dR between the two taus, and deta/dphi/dR
-    between the two neutrinos, for every true_/map_pred_/pred_/transformer_pred_
-    prefix."""
+    """Add the opening angle and dR between the two taus, deta/dphi/dR
+    between the two neutrinos, and dphi/dR between each neutrino and its
+    parent tau (nu <-> tau_minus, nubar <-> tau_plus), for every
+    true_/map_pred_/pred_/transformer_pred_ prefix."""
     df = df.copy()
     for prefix in ("true_", "map_pred_", "pred_", "transformer_pred_"):
         tau_needed = [f"{prefix}tau_plus_px", f"{prefix}tau_plus_py", f"{prefix}tau_plus_pz",
@@ -224,6 +237,20 @@ def add_angle_cols(df):
             df[f"{prefix}nu_nubar_deta"] = deta
             df[f"{prefix}nu_nubar_dphi"] = dphi
             df[f"{prefix}nu_nubar_dR"] = np.hypot(deta, dphi)
+
+        nu_taum_needed = [f"{prefix}nu_px", f"{prefix}nu_py", f"{prefix}nu_pz",
+                          f"{prefix}tau_minus_px", f"{prefix}tau_minus_py", f"{prefix}tau_minus_pz"]
+        if all(c in df.columns for c in nu_taum_needed):
+            _, dphi = _delta_eta_phi(*(df[c] for c in nu_taum_needed))
+            df[f"{prefix}nu_taum_dphi"] = dphi
+            df[f"{prefix}nu_taum_dR"] = _delta_r(*(df[c] for c in nu_taum_needed))
+
+        nubar_taup_needed = [f"{prefix}nubar_px", f"{prefix}nubar_py", f"{prefix}nubar_pz",
+                             f"{prefix}tau_plus_px", f"{prefix}tau_plus_py", f"{prefix}tau_plus_pz"]
+        if all(c in df.columns for c in nubar_taup_needed):
+            _, dphi = _delta_eta_phi(*(df[c] for c in nubar_taup_needed))
+            df[f"{prefix}nubar_taup_dphi"] = dphi
+            df[f"{prefix}nubar_taup_dR"] = _delta_r(*(df[c] for c in nubar_taup_needed))
     return df
 
 
@@ -281,35 +308,35 @@ def _draw_resolution(ax_res, true_vals, pred_vals, sampled_vals, show_sampled,
 
     pred_mu, pred_iqr = diff_pred.mean(), _iqr(diff_pred)
     ax_res.axvline(0.0, color="gray", linestyle="dashed", linewidth=1)
-    ax_res.hist(diff_pred, bins=diff_bins, histtype="step", density=True, linewidth=2.2, color=pred_color,
-                label=fr"TauPolaris (mode) ($\mu$={pred_mu:.3f}, IQR={pred_iqr:.3f})")
-    if show_sampled:
-        sampled_mu, sampled_iqr = diff_sampled.mean(), _iqr(diff_sampled)
-        ax_res.hist(diff_sampled, bins=diff_bins, histtype="step", density=True, linewidth=2.2, color=sampled_color,
-                    label=fr"TauPolaris (sampled) ($\mu$={sampled_mu:.3f}, IQR={sampled_iqr:.3f})")
     if show_transformer:
         transformer_mu, transformer_iqr = diff_transformer.mean(), _iqr(diff_transformer)
         ax_res.hist(diff_transformer, bins=diff_bins, histtype="step", density=True, linewidth=2.2, color=transformer_color,
-                    label=fr"Transformer ($\mu$={transformer_mu:.3f}, IQR={transformer_iqr:.3f})")
+                    label=fr"Transformer: $\mu$={transformer_mu:.3f}, IQR={transformer_iqr:.3f}")
+    if show_sampled:
+        sampled_mu, sampled_iqr = diff_sampled.mean(), _iqr(diff_sampled)
+        ax_res.hist(diff_sampled, bins=diff_bins, histtype="step", density=True, linewidth=2.2, color=sampled_color,
+                    label=fr"TauPolaris (sampled): $\mu$={sampled_mu:.3f}, IQR={sampled_iqr:.3f}")
+
+    ax_res.hist(diff_pred, bins=diff_bins, histtype="step", density=True, linewidth=2.2, color=pred_color,
+                label=fr"TauPolaris (MAP): $\mu$={pred_mu:.3f}, IQR={pred_iqr:.3f}")
     ax_res.set_xlabel("Resolution (Pred. - Truth)")
     ax_res.set_ylabel("a.u.")
     ax_res.set_xlim(diff_bins[0], diff_bins[-1])
     ymin, ymax = ax_res.get_ylim()
     ymax_mult = 1.35 + 0.15 * (int(show_sampled) + int(show_transformer))
     ax_res.set_ylim(ymin, ymax * ymax_mult)
-    ax_res.legend(loc="upper right", frameon=False, fontsize=11)
+    ax_res.legend(loc="upper right", frameon=True)
 
 
-def _draw_truth_pred_sampled(ax, ax_ratio, ax_res, true_vals, pred_vals, sampled_vals, show_sampled,
+def _draw_distribution_ratio(ax, ax_ratio, true_vals, pred_vals, sampled_vals, show_sampled,
                               transformer_vals, show_transformer, bins, ymax_mult):
     """Draw the gray-filled truth / blue predicted / orange sampled / green transformer
-    overlay, its pred-over-truth ratio panel, and the per-event resolution panel,
-    shared by all two-panel paper plots."""
+    overlay and its pred-over-truth ratio panel, shared by all distribution plots."""
     true_counts, _ = np.histogram(true_vals, bins=bins)
     true_hist, _ = np.histogram(true_vals, bins=bins, density=True)
+    # TODO: remove pred_hist (MAP), it's not needed now
     pred_hist, _ = np.histogram(pred_vals, bins=bins, density=True)
     with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = np.where(true_hist > 0, pred_hist / true_hist, np.nan)
         # Relative statistical (Poisson) uncertainty on the truth histogram itself,
         # shown as a band around 1.0 in the ratio panel.
         true_rel_err = np.where(true_counts > 0, 1.0 / np.sqrt(true_counts), np.nan)
@@ -323,24 +350,23 @@ def _draw_truth_pred_sampled(ax, ax_ratio, ax_res, true_vals, pred_vals, sampled
             transformer_ratio = np.where(true_hist > 0, transformer_hist / true_hist, np.nan)
 
     ax.hist(true_vals, bins=bins, histtype="stepfilled", density=True,
-            linewidth=0, color=truth_color, alpha=0.3,
+            linewidth=0, color=truth_color, alpha=0.8,
             label="Generator Truth")
-    if show_sampled:
-        ax.hist(sampled_vals, bins=bins, histtype="step", density=True,
-                linewidth=2.2, linestyle="solid", color=sampled_color,
-                label="TauPolaris (sampled)")
-    ax.hist(pred_vals, bins=bins, histtype="step", density=True,
-            linewidth=2.2, linestyle="solid", color=pred_color,
-            label="TauPolaris (mode)")
+    ax.hist(true_vals, bins=bins, histtype="step", density=True,
+            linewidth=0.5, color="black")
     if show_transformer:
         ax.hist(transformer_vals, bins=bins, histtype="step", density=True,
-                linewidth=2.2, linestyle="solid", color=transformer_color,
+                linewidth=2, linestyle="solid", color=transformer_color,
                 label="Transformer")
+    if show_sampled:
+        ax.hist(sampled_vals, bins=bins, histtype="step", density=True,
+                linewidth=2, linestyle="solid", color=sampled_color,
+                label="TauPolaris (sampled)")
     ax.set_ylabel("a.u.")
     ax.set_xlim(bins[0], bins[-1])
     ymin, ymax = ax.get_ylim()
     ax.set_ylim(ymin, ymax * ymax_mult)
-    ax.legend(loc="upper right", frameon=False)
+    ax.legend(loc="upper right", frameon=True)
     ax.tick_params(labelbottom=False)
 
     band_lower = np.where(true_counts > 0, 1.0 - true_rel_err, np.nan)
@@ -348,16 +374,13 @@ def _draw_truth_pred_sampled(ax, ax_ratio, ax_res, true_vals, pred_vals, sampled
     ax_ratio.fill_between(bins, np.append(band_lower, band_lower[-1]), np.append(band_upper, band_upper[-1]),
                            step="post", color="lightgrey", alpha=0.6, linewidth=0, zorder=0)
     ax_ratio.axhline(1.0, color="gray", linestyle="dashed", linewidth=1)
-    ax_ratio.stairs(ratio, bins, linewidth=2, color=pred_color)
-    if show_sampled:
-        ax_ratio.stairs(sampled_ratio, bins, linewidth=2, color=sampled_color)
     if show_transformer:
         ax_ratio.stairs(transformer_ratio, bins, linewidth=2, color=transformer_color)
+    if show_sampled:
+        ax_ratio.stairs(sampled_ratio, bins, linewidth=2, color=sampled_color)
     ax_ratio.set_ylabel("Pred. / Truth")
     ax_ratio.set_xlim(bins[0], bins[-1])
-    ax_ratio.set_ylim(0.5, 1.5)
-
-    _draw_resolution(ax_res, true_vals, pred_vals, sampled_vals, show_sampled, transformer_vals, show_transformer)
+    ax_ratio.set_ylim(0.8, 1.2)
 
 
 def _var_bins(var, true_vals, pred_vals, sampled_vals, show_sampled,
@@ -372,7 +395,11 @@ def _var_bins(var, true_vals, pred_vals, sampled_vals, show_sampled,
     if show_transformer:
         combined_parts.append(transformer_vals)
     combined = pd.concat(combined_parts)
-    if var.endswith('_E') or var.endswith('_mass') or var.endswith('_pt'):
+    if var in ('nu_taum_dR', 'nubar_taup_dR'):
+        bin_range = (0.0, 0.4)
+    elif var in ('nu_taum_dphi', 'nubar_taup_dphi'):
+        bin_range = (-0.25, 0.25)
+    elif var.endswith('_E') or var.endswith('_mass') or var.endswith('_pt'):
         bin_range = (combined.min(), combined.quantile(0.98))
     else:
         bin_range = (combined.quantile(0.01), combined.quantile(0.99))
@@ -380,10 +407,15 @@ def _var_bins(var, true_vals, pred_vals, sampled_vals, show_sampled,
 
 
 def plot_two_panel_vars(df, var_dict, output_dir, subdir, useMAP=True, bounded=False):
-    """Truth/pred/sampled overlay + ratio panel for every var in var_dict.
-    bounded=True fixes the histogram range to [-1, 1] (spin_vars, spin_density_vars);
-    otherwise the range is data-driven (pred_taunu_vars kinematics)."""
-    os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
+    """Truth/pred/sampled distribution+ratio plot and a separate resolution plot
+    for every var in var_dict, saved into distributions/ and resolutions/
+    subdirectories respectively. bounded=True fixes the histogram range to
+    [-1, 1] (spin_vars, spin_density_vars); otherwise the range is data-driven
+    (pred_taunu_vars kinematics)."""
+    dist_dir = os.path.join(output_dir, subdir, "distributions")
+    res_dir = os.path.join(output_dir, subdir, "resolutions")
+    os.makedirs(dist_dir, exist_ok=True)
+    os.makedirs(res_dir, exist_ok=True)
 
     for var, label in var_dict.items():
         true_col = f"true_{var}"
@@ -408,18 +440,23 @@ def plot_two_panel_vars(df, var_dict, output_dir, subdir, useMAP=True, bounded=F
         bins = _var_bins(var, true_vals, pred_vals, sampled_vals, show_sampled,
                           transformer_vals, show_transformer, bounded)
 
-        fig = plt.figure(figsize=(14, 8))
-        gs = fig.add_gridspec(2, 2, height_ratios=[3, 1], width_ratios=[1.5, 1.5], hspace=0.05, wspace=0.3)
-        ax = fig.add_subplot(gs[0, 0])
-        ax_ratio = fig.add_subplot(gs[1, 0], sharex=ax)
-        ax_res = fig.add_subplot(gs[:, 1])
-        _draw_truth_pred_sampled(ax, ax_ratio, ax_res, true_vals, pred_vals, sampled_vals, show_sampled,
+        fig_dist = plt.figure(figsize=(7, 7))
+        gs = fig_dist.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+        ax = fig_dist.add_subplot(gs[0])
+        ax_ratio = fig_dist.add_subplot(gs[1], sharex=ax)
+        _draw_distribution_ratio(ax, ax_ratio, true_vals, pred_vals, sampled_vals, show_sampled,
                                   transformer_vals, show_transformer, bins, ymax_mult)
         ax_ratio.set_xlabel(label)
+        fig_dist.savefig(os.path.join(dist_dir, f"{var}.pdf"))
+        plt.close(fig_dist)
 
-        fig.savefig(os.path.join(output_dir, subdir, f"{var}.pdf"))
-        plt.close(fig)
-        print(f">> Saved paper plot {var}.pdf")
+        fig_res, ax_res = plt.subplots(figsize=(7, 7))
+        _draw_resolution(ax_res, true_vals, pred_vals, sampled_vals, show_sampled,
+                          transformer_vals, show_transformer)
+        fig_res.savefig(os.path.join(res_dir, f"{var}.pdf"))
+        plt.close(fig_res)
+
+        print(f">> Saved paper plots {var}.pdf (distributions/ and resolutions/)")
 
 
 def plot_spin_vars(df, output_dir, useMAP=True, tag=''):
@@ -448,7 +485,10 @@ def plot_mass_vars(df, output_dir, useMAP=True, tag=''):
     overlay — just a dashed truth line against the predicted histogram(s)."""
     suffix = f'{tag}_' if tag else ''
     subdir = f'{suffix}paper_plots'
-    os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
+    dist_dir = os.path.join(output_dir, subdir, "distributions")
+    res_dir = os.path.join(output_dir, subdir, "resolutions")
+    os.makedirs(dist_dir, exist_ok=True)
+    os.makedirs(res_dir, exist_ok=True)
 
     for var in mass_vars:
         label = pred_taunu_vars[var]
@@ -476,44 +516,42 @@ def plot_mass_vars(df, output_dir, useMAP=True, tag=''):
 
         pred_mu, pred_sigma = pred_vals.mean(), pred_vals.std()
 
-        if has_true:
-            fig = plt.figure(figsize=(15, 7))
-            gs = fig.add_gridspec(1, 2, width_ratios=[1.5, 1.5], wspace=0.3)
-            ax = fig.add_subplot(gs[0, 0])
-        else:
-            fig, ax = plt.subplots(figsize=(8, 7))
+        fig_dist, ax = plt.subplots(figsize=(7, 7))
 
-        ax.axvline(truth_val, color=truth_color, linestyle="dashed", linewidth=2.2,
+        ax.axvline(truth_val, color=truth_line_color, linestyle="dashed", linewidth=2.2,
                    label=fr"Generator Truth ($\mu$={truth_val:.2f} GeV)")
-        ax.hist(pred_vals, bins=bins, histtype="step", density=True,
-                linewidth=2.2, linestyle="solid", color=pred_color,
-                label=fr"TauPolaris Predicted ($\mu$={pred_mu:.2f}, $\sigma$={pred_sigma:.2f} GeV)")
         if show_sampled:
             sampled_mu, sampled_sigma = sampled_vals.mean(), sampled_vals.std()
             ax.hist(sampled_vals, bins=bins, histtype="step", density=True,
                     linewidth=2.2, linestyle="solid", color=sampled_color,
-                    label=fr"TauPolaris Sampled ($\mu$={sampled_mu:.2f}, $\sigma$={sampled_sigma:.2f} GeV)")
+                    label=fr"TauPolaris Sampled $\mu$={sampled_mu:.2f}, $\sigma$={sampled_sigma:.2f}")
         if show_transformer:
             transformer_mu, transformer_sigma = transformer_vals.mean(), transformer_vals.std()
             ax.hist(transformer_vals, bins=bins, histtype="step", density=True,
                     linewidth=2.2, linestyle="solid", color=transformer_color,
-                    label=fr"Transformer ($\mu$={transformer_mu:.2f}, $\sigma$={transformer_sigma:.2f} GeV)")
+                    label=fr"Transformer: $\mu$={transformer_mu:.2f}, $\sigma$={transformer_sigma:.2f}")
+        # ax.hist(pred_vals, bins=bins, histtype="step", density=True,
+        #         linewidth=2.2, linestyle="solid", color=pred_color,
+        #         label=fr"TauPolaris (MAP): $\mu$={pred_mu:.2f}, $\sigma$={pred_sigma:.2f}")
         ax.set_xlabel(label)
         ax.set_ylabel("a.u.")
         ax.set_xlim(bins[0], bins[-1])
         ymin, ymax = ax.get_ylim()
         ax.set_ylim(ymin, ymax * ymax_mult)
-        ax.legend(loc="upper right", frameon=False)
+        ax.legend(loc="upper right", frameon=True)
+
+        fig_dist.savefig(os.path.join(dist_dir, f"{var}.pdf"))
+        plt.close(fig_dist)
 
         if has_true:
-            ax_res = fig.add_subplot(gs[0, 1])
+            fig_res, ax_res = plt.subplots(figsize=(7, 7))
             true_vals = df[true_col].dropna()
             _draw_resolution(ax_res, true_vals, pred_vals, sampled_vals, show_sampled,
                               transformer_vals, show_transformer)
+            fig_res.savefig(os.path.join(res_dir, f"{var}.pdf"))
+            plt.close(fig_res)
 
-        fig.savefig(os.path.join(output_dir, subdir, f"{var}.pdf"))
-        plt.close(fig)
-        print(f">> Saved paper plot {var}.pdf")
+        print(f">> Saved paper plots {var}.pdf (distributions/{' and resolutions/' if has_true else ''})")
 
 
 def paper_plot(df, output_dir, useMAP=True, tag=''):
