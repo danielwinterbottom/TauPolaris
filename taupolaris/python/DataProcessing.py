@@ -752,17 +752,11 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
             if proc.exitcode != 0:
                 raise RuntimeError(f"Preparing train/val/test split for dataset '{k}' failed (subprocess exit code {proc.exitcode}).")
 
-        train_df_ = pd.read_parquet(train_df_path)
-        val_df_ = pd.read_parquet(val_df_path)
+        train_df_ = pd.read_parquet(train_df_path, columns=keep_columns)
+        val_df_ = pd.read_parquet(val_df_path, columns=keep_columns)
         # test_df_ is never used again after being saved to disk above, so it's
         # not read back here.
 
-        # to save memory usage we also drop anything that isn't an input out output feature from the dataframes
-        #print size of dataframe in GB before dropping columns
-        print(f">> Size of train dataframe before dropping columns: {train_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
-        print(f">> Size of val dataframe before dropping columns: {val_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
-        train_df_ = train_df_[keep_columns]
-        val_df_ = val_df_[keep_columns]
         # print size of dataframe in GB after dropping columns
         print(f">> Size of train dataframe after dropping columns: {train_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
         print(f">> Size of val dataframe after dropping columns: {val_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
