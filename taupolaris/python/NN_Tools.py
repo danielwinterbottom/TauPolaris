@@ -98,6 +98,12 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
     train_dataloader = DataLoader(train_dataset, batch_size=hp['batch_size'], shuffle=True)
     test_dataloader = DataLoader(test_dataset, batch_size=hp['batch_size'], shuffle=False)
 
+    if train_dataset.weights is not None:
+        print(f">> Training WITH per-event weights (train mean={train_dataset.weights.mean().item():.4f}, "
+              f"val mean={test_dataset.weights.mean().item():.4f}); loss will be a weighted mean.")
+    else:
+        print(">> Training WITHOUT per-event weights (all events weighted equally).")
+
     if useMLP:
         model = MLP(input_size=len(input_features), output_size=len(output_features), num_blocks=hp['num_blocks'],
                     hidden_size=hp['hidden_size'], activation=nn.GELU())
