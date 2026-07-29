@@ -40,9 +40,17 @@ class RegressionDataset(Dataset):
             returns (X, y, w) triples instead of (X, y) pairs -- see
             get_train_val_test_datasets/train_model for how these are combined
             from TauSpinner weight columns and used in the loss.
+        no_standardize_features : list[str] or None
+            Names of columns (from input_features and/or output_features) to
+            leave untouched, e.g. boolean flags that shouldn't be standardized.
         """
         X = torch.tensor(dataframe[input_features].values, dtype=torch.float32)
         y = torch.tensor(dataframe[output_features].values, dtype=torch.float32)
+
+        no_standardize_features = ['reco_taup_haspizero', 'reco_taun_haspizero', 'reco_taup_is3prong', 'reco_taun_is3prong', 'reco_tau2_haspizero', 'reco_tau2_is3prong']
+        input_skip_mask = torch.tensor(
+            [col in no_standardize_features for col in input_features]
+        )
 
         self.normalize_inputs = normalize_inputs
         self.normalize_outputs = normalize_outputs
@@ -57,6 +65,9 @@ class RegressionDataset(Dataset):
             else:
                 self.input_mean = input_mean
                 self.input_std = input_std.clamp_min(eps)
+
+            self.input_mean[:, input_skip_mask] = 0.0
+            self.input_std[:, input_skip_mask] = 1.0
 
             X = (X - self.input_mean) / self.input_std
         else:
@@ -752,14 +763,15 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
             if proc.exitcode != 0:
                 raise RuntimeError(f"Preparing train/val/test split for dataset '{k}' failed (subprocess exit code {proc.exitcode}).")
 
+        # only load the columns we actually need, so we never pay the memory
+        # cost of reading the full dataframe from disk
         train_df_ = pd.read_parquet(train_df_path, columns=keep_columns)
         val_df_ = pd.read_parquet(val_df_path, columns=keep_columns)
         # test_df_ is never used again after being saved to disk above, so it's
         # not read back here.
 
-        # print size of dataframe in GB after dropping columns
-        print(f">> Size of train dataframe after dropping columns: {train_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
-        print(f">> Size of val dataframe after dropping columns: {val_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
+        print(f">> Size of train dataframe: {train_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
+        print(f">> Size of val dataframe: {val_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
 
         if train_df is None:
             train_df = train_df_
