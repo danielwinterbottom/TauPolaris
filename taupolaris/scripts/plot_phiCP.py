@@ -10,7 +10,7 @@ import numpy as np
 import awkward as ak
 import argparse
 import os
-
+import yaml
 import math
 from taupolaris.utils.calculate_hh import Particle, _prepare_kinematic_for_hh, calculateHH, getHHVectors
 
@@ -37,8 +37,9 @@ options = {
 # of separate even/odd/mix files -- e.g. an evaluate_polvec.py output parquet, which carries
 # tauspinner_wt_alpha0/45/90 weight columns
 'uncorr': 'outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet',
-# 'uncorr': 'outputs_PlainTransformer_Uncorr_Masked_Hadronic_25e_July28/output_results.parquet',
+# 'uncorr': 'outputs_PlainTransformer_Uncorr_Masked_Hadronic_100e_July29/output_results.parquet',
 'sl_uncorr': 'outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_results.parquet',
+# 'sl_uncorr': 'outputs_PlainTransformer_Uncorr_Masked_Semileptonic_100e_Aug3/output_results.parquet',
 },
     'gen': {
         'label': 'Generator Neutrino',
@@ -69,6 +70,7 @@ options = {
         'tag':   'PolVecDirect',
     },
 }
+
 
 def _build_daughters_for_hh(row, side, tau_prefix='true', pion_prefix='true'):
     """Build Particle list for calculateHH from a dataframe row."""
@@ -338,16 +340,25 @@ class HandlerStepLine(HandlerPatch):
 
 
 def plot_phicp_histogram(ax, data, bin_edges, variable, label, color, hide_errors=False, weights=None):
-    bin_width = bin_edges[1] - bin_edges[0]
+
     step_x = np.repeat(bin_edges, 2)[1:-1]
-    raw, _ = np.histogram(data[variable], bins=bin_edges, weights=weights)
-    counts = raw / (raw.sum() * bin_width)
+    N = len(data[variable])
+
+    # Use 1/N weights instead of densitiy
+    if weights is None:
+        w = np.ones(N) / N
+    else:
+        w = np.asarray(weights)
+        w = w / w.sum() # check tauspinner weights are normalised to 1
+
+
+    counts, _ = np.histogram(data[variable], bins=bin_edges, weights=w)
     ax.hist(data[variable], bins=bin_edges, histtype='step', label=label,
-            density=True, linewidth=2, color=color, weights=weights)
+            density=False, linewidth=2, color=color, weights=w)
+
     if not hide_errors:
-        # for weighted histograms this is an approximate (unweighted-count-based) error band
-        raw_unweighted, _ = np.histogram(data[variable], bins=bin_edges)
-        err = np.sqrt(raw_unweighted) / (raw.sum() * bin_width) if weights is not None else np.sqrt(raw) / (raw.sum() * bin_width)
+        w2_counts, _ = np.histogram(data[variable], bins=bin_edges, weights=w**2)
+        err = np.sqrt(w2_counts)
         ax.fill_between(step_x, np.repeat(counts - err, 2),
                         np.repeat(counts + err, 2), alpha=0.25, color=color)
     return counts
@@ -459,6 +470,8 @@ def main():
         if args.option in ('gen_ts', 'recoNu_ts', 'recoNu_hybrid'):
             dm_combs += [[0, 11], [1,11], [2,11], [10,11], [11,11]]
 
+    asymmetry_dict = {}
+
     for dm_taup, dm_taun in dm_combs:
 
         dm_mask = lambda df, p=dm_taup, n=dm_taun: ((df['taup_DM'] == p) & (df['taun_DM'] == n)) | ((df['taun_DM'] == n) & (df['taup_DM'] == p))
@@ -490,7 +503,6 @@ def main():
             plot_phicp_histogram(ax, zprime, bin_edges, 'phiCP', r'Zprime ($\alpha=180^\circ$)', 'black', hide)
         avg = 0.5 * (even_counts + odd_counts)
         asymmetry = np.mean(np.abs(even_counts - odd_counts) / avg)
-
         significance = 0 
         for i in range(len(even_counts)):
             b_est = (odd_counts[i] + even_counts[i])*0.5*4
@@ -499,6 +511,7 @@ def main():
             significance += temp
         #significance = np.sqrt(2 * significance)
         significance = np.sqrt(significance)
+        asymmetry_dict[f"DM{dm_taup}DM{dm_taun}"] = {'asymmetry': significance, 'N': len(even)}
 
         
 
@@ -508,7 +521,7 @@ def main():
 
         ax.set_xlabel(r'$\phi_{CP}$')
         ax.set_xlim(0, 2 * np.pi)
-        ax.set_ylim(0, 0.3)
+        ax.set_ylim(0, 0.11)
         ax.set_ylabel('Normalized counts')
         ax.legend(loc='upper right', handler_map={matplotlib.patches.Polygon: HandlerStepLine()})
         ax.text(0.05, 0.95, f'{dm_taup_label} - {dm_taun_label}', transform=ax.transAxes,
@@ -532,6 +545,12 @@ def main():
             odd_counts=odd_counts,
             bin_edges=bin_edges,
         )
+
+    print(asymmetry_dict)
+    with open('asymmetry.yaml', 'w') as file:
+        yaml.dump(asymmetry_dict, file)
+
+
 
 if __name__ == '__main__':
     main()
