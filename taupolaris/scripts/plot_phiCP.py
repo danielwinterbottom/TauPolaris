@@ -1,6 +1,9 @@
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.legend_handler import HandlerPatch
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
 import pandas as pd
 import mplhep as hep
 import numpy as np
@@ -20,7 +23,8 @@ from taupolaris.utils.acoplanarity_tools import (
 )
 
 plt.style.use(hep.style.CMS)
-plt.rcParams.update({"font.size": 16})
+plt.rcParams.update({"font.size": 18, "axes.labelsize": 18, "xtick.labelsize": 18,
+                      "ytick.labelsize": 18, "legend.fontsize": 18})
 
 options = {
     'files':{  # set files here (ones from eval have all info we need)
@@ -32,8 +36,9 @@ options = {
 # single TauSpinner-reweightable ("uncorrelated") sample, used with --uncorrelated instead
 # of separate even/odd/mix files -- e.g. an evaluate_polvec.py output parquet, which carries
 # tauspinner_wt_alpha0/45/90 weight columns
-'uncorr': 'outputs_model_LHC_TransformerFlow_PolVecDirect_Hadronic_Weighted_onorm_July13/polvec_eval_results_output_results_UnCorr_large.parquet',
-'sl_uncorr': None,
+'uncorr': 'outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet',
+# 'uncorr': 'outputs_PlainTransformer_Uncorr_Masked_Hadronic_25e_July28/output_results.parquet',
+'sl_uncorr': 'outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_results.parquet',
 },
     'gen': {
         'label': 'Generator Neutrino',
@@ -44,19 +49,19 @@ options = {
         'tag':   'POL_GEN_TS',
     },
     'recoRun3': {
-        'label': 'Run 3 Reconstruction',
+        'label': 'Approximate Methods',
         'tag':   'RecoRun3',
     },
     'recoNu': {
-        'label': 'Regressed Neutrino',
+        'label': 'TauPolaris',
         'tag':   'RecoNu_Smeared',
     },
     'recoNu_ts': {
-        'label': 'Regressed Neutrino (TauSpinner)',
+        'label': 'TauPolaris',
         'tag':   'RecoNu_Smeared_TS',
     },
     'recoNu_hybrid': {
-        'label': 'Regressed Neutrino (Hybrid)',
+        'label': 'TauPolaris',
         'tag':   'RecoNu_Smeared_Hybrid',
     },
     'recoPolvec': {
@@ -320,6 +325,18 @@ def add_or_get_DM(df, dm_prefix='reco'):
             return df
     return add_DM(df, dm_prefix=dm_prefix)
 
+class HandlerStepLine(HandlerPatch):
+    """Draws step-histogram legend entries as a line with a shaded band, matching the
+    line+fill_between style used on the axes instead of matplotlib's default box."""
+    def create_artists(self, legend, orig_handle, xdescent, ydescent, width, height, fontsize, trans):
+        color = orig_handle.get_edgecolor()
+        band = Rectangle((xdescent, ydescent), width, height, facecolor=color, edgecolor='none',
+                          alpha=0.25, transform=trans)
+        line = Line2D([xdescent, xdescent + width], [ydescent + height / 2, ydescent + height / 2],
+                      color=color, linewidth=2, transform=trans)
+        return [band, line]
+
+
 def plot_phicp_histogram(ax, data, bin_edges, variable, label, color, hide_errors=False, weights=None):
     bin_width = bin_edges[1] - bin_edges[0]
     step_x = np.repeat(bin_edges, 2)[1:-1]
@@ -456,21 +473,21 @@ def main():
         if args.uncorrelated:
             # even/odd/mix are all the same reweightable sample here -- apply the TauSpinner
             # weight for each CP hypothesis instead of using separately-generated samples
-            even_counts = plot_phicp_histogram(ax, even, bin_edges, 'phiCP', 'CP-even', 'red',
+            even_counts = plot_phicp_histogram(ax, even, bin_edges, 'phiCP', r'CP-even ($\alpha=0^\circ$)', 'red',
                                                 hide, weights=even['tauspinner_wt_alpha0'].values)
-            odd_counts  = plot_phicp_histogram(ax, odd,  bin_edges, 'phiCP', 'CP-odd',  'blue',
+            odd_counts  = plot_phicp_histogram(ax, odd,  bin_edges, 'phiCP', r'CP-odd ($\alpha=90^\circ$)',  'blue',
                                                 hide, weights=odd['tauspinner_wt_alpha90'].values)
-            plot_phicp_histogram(ax, even, bin_edges, 'phiCP', 'CP-mix', 'green',
+            plot_phicp_histogram(ax, even, bin_edges, 'phiCP', r'CP-mix ($\alpha=45^\circ$)', 'green',
                                  hide, weights=even['tauspinner_wt_alpha45'].values)
         else:
-            even_counts = plot_phicp_histogram(ax, even, bin_edges, 'phiCP', 'CP-even', 'red',   hide)
-            odd_counts  = plot_phicp_histogram(ax, odd,  bin_edges, 'phiCP', 'CP-odd',  'blue',  hide)
+            even_counts = plot_phicp_histogram(ax, even, bin_edges, 'phiCP', r'CP-even ($\alpha=0^\circ$)', 'red',   hide)
+            odd_counts  = plot_phicp_histogram(ax, odd,  bin_edges, 'phiCP', r'CP-odd ($\alpha=90^\circ$)',  'blue',  hide)
             if mix_df is not None:
                 mix = mix_df[dm_mask(mix_df)]
-                plot_phicp_histogram(ax, mix, bin_edges, 'phiCP', 'CP-mix', 'green', hide)
+                plot_phicp_histogram(ax, mix, bin_edges, 'phiCP', r'CP-mix ($\alpha=45^\circ$)', 'green', hide)
         if zprime_df is not None:
             zprime = zprime_df[dm_mask(zprime_df)]
-            plot_phicp_histogram(ax, zprime, bin_edges, 'phiCP', 'Zprime', 'black', hide)
+            plot_phicp_histogram(ax, zprime, bin_edges, 'phiCP', r'Zprime ($\alpha=180^\circ$)', 'black', hide)
         avg = 0.5 * (even_counts + odd_counts)
         asymmetry = np.mean(np.abs(even_counts - odd_counts) / avg)
 
@@ -485,17 +502,26 @@ def main():
 
         
 
+        dm_labels = {0: r'$1\pi^\pm0\pi^0$', 1: r'$1\pi^\pm1\pi^0$', 2: r'$1\pi^\pm2\pi^0$', 10: r'$3\pi^\pm0\pi^0$', 11: r'$3\pi^\pm1\pi^0$', 100: r'$\tau_\ell$'}
+        dm_taup_label = dm_labels.get(dm_taup, f'DM{dm_taup}')
+        dm_taun_label = dm_labels.get(dm_taun, f'DM{dm_taun}')
+
         ax.set_xlabel(r'$\phi_{CP}$')
-        ax.set_title(f'DM{dm_taup} - DM{dm_taun} - {options[args.option]["label"]}')
         ax.set_xlim(0, 2 * np.pi)
-        ax.set_ylim(0, 0.28)
-        ax.legend()
-        ax.text(0.05, 0.95, f'Asymmetry: {asymmetry:.4f}', transform=ax.transAxes,
+        ax.set_ylim(0, 0.3)
+        ax.set_ylabel('Normalized counts')
+        ax.legend(loc='upper right', handler_map={matplotlib.patches.Polygon: HandlerStepLine()})
+        ax.text(0.05, 0.95, f'{dm_taup_label} - {dm_taun_label}', transform=ax.transAxes,
                 verticalalignment='top', fontweight='bold')
-        ax.text(0.05, 0.85, f'Asymmetry (quadrature): {significance:.4f}', transform=ax.transAxes,
+        ax.text(0.05, 0.88, f'Asymmetry: {significance:.3f}', transform=ax.transAxes,
                 verticalalignment='top', fontweight='bold')
+        option_label = options[args.option]["label"] if not args.useMLP else "Transformer"
+        ax.text(0.05, 0.05, option_label, transform=ax.transAxes,
+                verticalalignment='bottom', fontweight='bold')
+        # ax.text(0.05, 0.85, f'Asymmetry (quadrature): {significance:.4f}', transform=ax.transAxes,
+                # verticalalignment='top', fontweight='bold')
         out = f"{args.output_dir}/{args.option}/DM{dm_taup}DM{dm_taun}_{options[args.option]['tag']}.pdf"
-        plt.savefig(out)
+        plt.savefig(out, bbox_inches='tight')
         plt.close()
         print(f"Saved {out}")
 
