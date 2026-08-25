@@ -5,11 +5,51 @@ import yaml
 import os
 import uproot
 import numpy as np
+from tqdm import tqdm
 from taupolaris.python.NN_Tools import load_model, get_device, is_legacy_pizero_proj_checkpoint
-from taupolaris.python.DataProcessing import get_test_dataset
+from taupolaris.python.DataProcessing import get_test_dataset, RegressionDataset
 from taupolaris.utils.coordinate_conversions import convert_coordinates_pred
 from taupolaris.python.Evaluation_Tools import flow_map_predict, compute_spin_vars, save_sampled_pdfs, plot_spin_density_matrix
 from taupolaris.utils.kinematic_helpers import compute_spin_density_vars, add_energies_pair, add_energy, inv_mass
+from taupolaris.utils.acoplanarity_tools import get_ditau_polarimetric, compute_aco_polarimetric
+
+
+def circular_std(angles, axis=-1):
+    """Circular standard deviation (Mardia & Jupp). phiCP is periodic on
+    [0, 2*pi), so a naive std would report a spuriously large error for any
+    event whose central estimate sits near the 0/2*pi seam with samples
+    landing just across it (e.g. central~0.02 rad with samples at ~0.01 and
+    ~6.27 -- actually tightly clustered, not ~6 rad apart). Same definition
+    as evaluate_polvec.py's circular_std."""
+    mean_cos = np.mean(np.cos(angles), axis=axis)
+    mean_sin = np.mean(np.sin(angles), axis=axis)
+    R = np.clip(np.sqrt(mean_cos ** 2 + mean_sin ** 2), 1e-12, 1.0)
+    return np.sqrt(-2.0 * np.log(R))
+
+
+def _phiCP_dm_codes(df, prefix):
+    """Per-tau decay-mode code (0/1/2/10/11 hadronic, 100 leptonic, -1
+    unmatched), needed by get_ditau_polarimetric. Same convention as
+    plot_phiCP.py's add_DM / evaluate_polvec.py's add_DM. `prefix` is the
+    reconstruction level to classify at ('reco' or 'true'), matching
+    whichever level the pion four-momenta are taken from."""
+    dm = {}
+    for tau in ('taup', 'taun'):
+        is_lep = df[f'{prefix}_{tau}_ishadronic'].values == 0
+        npizero = df[f'{prefix}_{tau}_npizero'].values
+        is3prong = df[f'{prefix}_{tau}_is3prong'].values
+        is_dm0 = (npizero == 0) & (is3prong == 0) & (~is_lep)
+        is_dm1 = (npizero == 1) & (is3prong == 0) & (~is_lep)
+        is_dm2 = ((npizero == 1) | (npizero == 2)) & (is3prong == 0) & (~is_lep)
+        is_dm10 = (npizero == 0) & (is3prong == 1) & (~is_lep)
+        is_dm11 = (npizero == 1) & (is3prong == 1) & (~is_lep)
+        dm[tau] = np.where(is_dm0, 0,
+                    np.where(is_dm1, 1,
+                        np.where(is_dm2, 2,
+                            np.where(is_dm10, 10,
+                                np.where(is_dm11, 11,
+                                    np.where(is_lep, 100, -1))))))
+    return dm['taup'], dm['taun']
 
 
 def main():
@@ -22,6 +62,8 @@ def main():
     argparser.add_argument('--threeprong', help='whether to only evaluate on events with at least 1 3-prong tau', action='store_true')
     argparser.add_argument('--make_root_output', help='whether to save the results in a root file as well as a pandas dataframe', action='store_true')
     argparser.add_argument('--inc_significance', help='whether to include the estimate of the neutrino \"significance\"', action='store_true')
+    argparser.add_argument('--inc_phiCP_error', help='whether to compute phiCP from the predicted neutrino (pred_phiCP/map_pred_phiCP) and its per-event uncertainty (pred_phiCP_err) from repeated flow sampling -- the error from the neutrino regression alone, with all visible momenta held fixed. Needs the flow\'s posterior, so has no effect with --useMLP/--useTransformerBaseline.', action='store_true')
+    argparser.add_argument('--n_flow_samples_phiCP', type=int, default=50, help='number of flow samples per event used to estimate the phiCP uncertainty (only used with --inc_phiCP_error)')
     args = argparser.parse_args()
 
     # load config
@@ -96,6 +138,17 @@ def main():
         data_config["test_output_name"] = test_output_name
         test_dataset, test_df, _, _ = get_test_dataset(data_config, norm_data, oneprong=args.oneprong)
 
+        # TEMPORARY FILTER -- keep only events where both taus are reco DM=0
+        # (1-prong, no pi0). Remove once done testing.
+        dm0_mask = ((test_df['reco_taup_npizero'] == 0) & (test_df['reco_taup_is3prong'] == 0) &
+                    (test_df['reco_taun_npizero'] == 0) & (test_df['reco_taun_is3prong'] == 0))
+        print(f">> TEMPORARY FILTER: keeping only DM=0/DM=0 events: {dm0_mask.sum()}/{len(test_df)}")
+        test_df = test_df[dm0_mask].reset_index(drop=True)
+        test_dataset = RegressionDataset(
+            test_df, input_features, output_features, normalize_inputs=True, normalize_outputs=True,
+            input_mean=torch.from_numpy(norm_data['input_mean']), input_std=torch.from_numpy(norm_data['input_std']),
+            output_mean=torch.from_numpy(norm_data['output_mean']), output_std=torch.from_numpy(norm_data['output_std']),
+        )
 
         print(f'Evaluating on test dataset {test_dataset_name}')
         print(f'Number of events in test dataset: {len(test_dataset)}')
@@ -605,6 +658,118 @@ def main():
                 if predictions_map is not None:
                     del map_pred_Bplus, map_pred_Bminus, map_pred_C, map_pred_con, map_pred_m12
             del dm_masks
+
+        # === phiCP from the predicted neutrino, and its uncertainty from repeated flow sampling ===
+        # Central estimate: single-sample ('pred') and, if available, MAP ('map_pred') phiCP,
+        # via the same get_ditau_polarimetric + compute_aco_polarimetric method plot_phiCP.py's
+        # 'recoNu' option uses downstream on this script's own output -- computed here too since
+        # an error estimate is meaningless without the corresponding central value alongside it.
+        # Uncertainty: draw n_flow_samples_phiCP fresh posterior samples/event, recompute phiCP
+        # for each with the visible momenta held fixed, and take the circular spread (phiCP is
+        # periodic, so a plain std would misreport events whose phiCP sits near the 0/2*pi seam)
+        # -- this isolates the error coming from the neutrino regression alone.
+        if args.inc_phiCP_error:
+            if args.useMLP or args.useTransformerBaseline:
+                print("WARNING: --inc_phiCP_error needs the flow's posterior (model.sample()), "
+                      "which --useMLP/--useTransformerBaseline don't have; skipping.")
+            else:
+                pion_prefix = 'reco' if use_reco else 'true'
+                reco_pions = (pion_prefix == 'reco')
+                print(f"Computing phiCP from the predicted neutrino (pion_prefix={pion_prefix}) and its "
+                      f"uncertainty from {args.n_flow_samples_phiCP} flow samples/event...")
+
+                results_df['taup_DM'], results_df['taun_DM'] = _phiCP_dm_codes(results_df, pion_prefix)
+
+                def _phiCP_from_df(df, tau_prefix):
+                    R1, P1, R2, P2 = get_ditau_polarimetric(df, tau_prefix=tau_prefix, reco_pions=reco_pions)
+                    return np.asarray(compute_aco_polarimetric(R1, P1, R2, P2))
+
+                # central (point) estimates
+                results_df['pred_phiCP'] = _phiCP_from_df(results_df, 'pred')
+                if predictions_map is not None:
+                    results_df['map_pred_phiCP'] = _phiCP_from_df(results_df, 'map_pred')
+
+                # fixed (sample-independent) inputs needed per event: visible pion/pizero/charged
+                # four-vectors (for get_ditau_polarimetric) and the decay-mode codes, all read back
+                # from results_df's own saved columns rather than the loose per-particle numpy
+                # arrays used earlier in this function, which are already deleted by this point.
+                pion_cols = [f'{pion_prefix}_{tau}_{part}_{comp}'
+                             for tau in ('taup', 'taun')
+                             for part in ('pi1', 'pi2', 'pi3', 'pizero1', 'charged')
+                             for comp in ('E', 'px', 'py', 'pz')]
+                pion_cols = [c for c in pion_cols if c in results_df.columns]
+                pion_vals_full = results_df[pion_cols].values
+                dm_vals_full = results_df[['taup_DM', 'taun_DM']].values
+
+                def _charged_pi0(tau):
+                    charged = results_df[[f'{pion_prefix}_{tau}_charged_{c}' for c in ('E', 'px', 'py', 'pz')]].values
+                    pi0     = results_df[[f'{pion_prefix}_{tau}_pizero1_{c}' for c in ('E', 'px', 'py', 'pz')]].values
+                    return charged, pi0
+                taup_charged_full, taup_pi0_full = _charged_pi0('taup')
+                taun_charged_full, taun_pi0_full = _charged_pi0('taun')
+
+                n_fs = args.n_flow_samples_phiCP
+                # each call below processes (events_in_chunk * n_fs) rows in one shot -- reusing
+                # sample_chunk_size unchanged here would mean e.g. 50000*50 = 2.5M rows per call;
+                # dividing by n_fs keeps each call close to the per-call scale used elsewhere in
+                # this script (same empirically-tuned approach as evaluate_polvec.py).
+                err_chunk_size = max(1, sample_chunk_size // n_fs)
+                n_events = len(results_df)
+                phiCP_err = np.full(n_events, np.nan)
+                n_sample_failures = 0
+                for start in tqdm(range(0, n_events, err_chunk_size), desc="Processing chunks (phiCP uncertainty)"):
+                    end = min(start + err_chunk_size, n_events)
+                    C = end - start
+
+                    # model.sample() occasionally hits a rare, non-reproducible numerical
+                    # instability in nflows's rational-quadratic spline inverse (an assertion
+                    # on a negative discriminant, from FP32 precision near bin-boundary
+                    # derivatives for an unlucky random draw) -- not tied to any particular
+                    # input event, confirmed by retrying the exact same chunk with fresh
+                    # random noise. Retry a few times before giving up on the chunk.
+                    samples_norm = None
+                    for attempt in range(5):
+                        try:
+                            with torch.no_grad():
+                                samples_norm = model.sample(num_samples=n_fs, context=X_test[start:end])  # [C, n_fs, F]
+                            break
+                        except AssertionError:
+                            continue
+                    if samples_norm is None:
+                        n_sample_failures += 1
+                        continue
+
+                    samples = test_dataset.destandardize_outputs(samples_norm).cpu().numpy().reshape(C * n_fs, -1)
+
+                    rep = lambda arr: np.repeat(arr[start:end], n_fs, axis=0)
+                    conv_kwargs_chunk = dict(coordinates=coordinates, output_features=output_features,
+                                              tau1_charged=rep(taup_charged_full), tau1_pi0=rep(taup_pi0_full),
+                                              tau2_charged=rep(taun_charged_full), tau2_pi0=rep(taun_pi0_full),
+                                              leptonic_mode=leptonic_mode)
+                    samples = convert_coordinates_pred(samples, **conv_kwargs_chunk)
+                    samples = add_energies_pair(samples)
+
+                    tau_plus_samp  = samples[:, 0:4] + rep(taup_charged_full) + rep(taup_pi0_full)
+                    tau_minus_samp = samples[:, 4:8] + rep(taun_charged_full) + rep(taun_pi0_full)
+
+                    tmp_df = pd.DataFrame(np.repeat(pion_vals_full[start:end], n_fs, axis=0), columns=pion_cols)
+                    dm_chunk = np.repeat(dm_vals_full[start:end], n_fs, axis=0)
+                    tmp_df['taup_DM'] = dm_chunk[:, 0]
+                    tmp_df['taun_DM'] = dm_chunk[:, 1]
+                    tmp_df['samp_tau_plus_E'],  tmp_df['samp_tau_plus_px']  = tau_plus_samp[:, 0],  tau_plus_samp[:, 1]
+                    tmp_df['samp_tau_plus_py'], tmp_df['samp_tau_plus_pz']  = tau_plus_samp[:, 2],  tau_plus_samp[:, 3]
+                    tmp_df['samp_tau_minus_E'],  tmp_df['samp_tau_minus_px'] = tau_minus_samp[:, 0], tau_minus_samp[:, 1]
+                    tmp_df['samp_tau_minus_py'], tmp_df['samp_tau_minus_pz'] = tau_minus_samp[:, 2], tau_minus_samp[:, 3]
+
+                    phiCP_samples = _phiCP_from_df(tmp_df, 'samp').reshape(C, n_fs)
+                    phiCP_err[start:end] = circular_std(phiCP_samples, axis=1)
+
+                if n_sample_failures > 0:
+                    print(f"  WARNING: flow sampling failed on 5 retries for {n_sample_failures} chunk(s) "
+                          f"({n_sample_failures * err_chunk_size} events, upper bound); phiCP_err set to NaN for those events.")
+
+                results_df['pred_phiCP_err'] = phiCP_err
+                del pion_vals_full, dm_vals_full, taup_charged_full, taup_pi0_full, taun_charged_full, taun_pi0_full, phiCP_err
 
         # write the results dataframe to a parquet file
         results_df.to_parquet(f"{output_dir}/{data_config['test_output_name']}.parquet")
