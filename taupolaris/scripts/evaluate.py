@@ -7,7 +7,7 @@ import uproot
 import numpy as np
 from tqdm import tqdm
 from taupolaris.python.NN_Tools import load_model, get_device, is_legacy_pizero_proj_checkpoint
-from taupolaris.python.DataProcessing import get_test_dataset, RegressionDataset
+from taupolaris.python.DataProcessing import get_test_dataset
 from taupolaris.utils.coordinate_conversions import convert_coordinates_pred
 from taupolaris.python.Evaluation_Tools import flow_map_predict, compute_spin_vars, save_sampled_pdfs, plot_spin_density_matrix
 from taupolaris.utils.kinematic_helpers import compute_spin_density_vars, add_energies_pair, add_energy, inv_mass
@@ -137,18 +137,6 @@ def main():
         data_config["test_dataset"] = test_dataset_name
         data_config["test_output_name"] = test_output_name
         test_dataset, test_df, _, _ = get_test_dataset(data_config, norm_data, oneprong=args.oneprong)
-
-        # TEMPORARY FILTER -- keep only events where both taus are reco DM=0
-        # (1-prong, no pi0). Remove once done testing.
-        dm0_mask = ((test_df['reco_taup_npizero'] == 0) & (test_df['reco_taup_is3prong'] == 0) &
-                    (test_df['reco_taun_npizero'] == 0) & (test_df['reco_taun_is3prong'] == 0))
-        print(f">> TEMPORARY FILTER: keeping only DM=0/DM=0 events: {dm0_mask.sum()}/{len(test_df)}")
-        test_df = test_df[dm0_mask].reset_index(drop=True)
-        test_dataset = RegressionDataset(
-            test_df, input_features, output_features, normalize_inputs=True, normalize_outputs=True,
-            input_mean=torch.from_numpy(norm_data['input_mean']), input_std=torch.from_numpy(norm_data['input_std']),
-            output_mean=torch.from_numpy(norm_data['output_mean']), output_std=torch.from_numpy(norm_data['output_std']),
-        )
 
         print(f'Evaluating on test dataset {test_dataset_name}')
         print(f'Number of events in test dataset: {len(test_dataset)}')
