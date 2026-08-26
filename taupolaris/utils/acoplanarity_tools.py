@@ -7,6 +7,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="divide by ze
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in multiply")
 vector.register_awkward()
 from taupolaris.utils.PolarimetricA1 import PolarimetricA1_vectorised
+from taupolaris.utils.Polarimetric3hpi0 import Polarimetric3hpi0_vectorised
 
 def pt_direction_to_momentum4d(pt, direction, mass):
     # get p vector from pT and direction vector (cartesian)
@@ -83,6 +84,21 @@ def polarimetric_vec_dm10(tau_rf, os_pi_rf, ss1_pi_rf, ss2_pi_rf, taucharge):
     ss2_trf   = boost4(ss2_pi_rf, bv_tau)
     pv = PolarimetricA1_vectorised(tau_trf, os_trf, ss1_trf, ss2_trf, taucharge).PVC()
     # note the sign reversal here by convention
+    pv_ak = ak.zip({"x": -pv.x, "y": -pv.y, "z": -pv.z}, with_name="Vector3D")
+    return pv_ak.unit()
+
+def polarimetric_vec_dm11(tau_rf, os_pi_rf, ss1_pi_rf, ss2_pi_rf, pizero_rf, taucharge):
+    """Compute the DM11 (3h+pi0) polarimetric vector in the tau rest frame, using the
+    vectorised CLEO 4-pion (tauola curr_cleo MNUM=1) hadronic current -- see
+    Polarimetric3hpi0.py. Same calling convention as polarimetric_vec_dm10."""
+    bv_tau = boost_vec(tau_rf)
+    tau_trf   = boost4(tau_rf,     bv_tau)
+    os_trf    = boost4(os_pi_rf,   bv_tau)
+    ss1_trf   = boost4(ss1_pi_rf,  bv_tau)
+    ss2_trf   = boost4(ss2_pi_rf,  bv_tau)
+    piz_trf   = boost4(pizero_rf,  bv_tau)
+    pv = Polarimetric3hpi0_vectorised(tau_trf, os_trf, ss1_trf, ss2_trf, piz_trf, taucharge).PVC()
+    # note the sign reversal here by convention (same as polarimetric_vec_dm10)
     pv_ak = ak.zip({"x": -pv.x, "y": -pv.y, "z": -pv.z}, with_name="Vector3D")
     return pv_ak.unit()
 
@@ -443,15 +459,17 @@ def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=Tr
 
     taup_s = ak.where(taup_is_dm0, polarimetric_vec_dm0(piOS_p_rf, bv_taup),
                         ak.where(taup_is_dm1or2, polarimetric_vec_dm1(piOS_p_rf, pizero_p_rf, tau_p_rf, bv_taup),
-                                 ak.where(taup_is_dm10 | taup_is_dm11, polarimetric_vec_dm10(tau_p_rf, piOS_p_rf, piSS1_p_rf, piSS2_p_rf, +1),
-                                    ak.where(taup_is_leptonic, polarimetric_vec_leptonic(lep_p_rf, bv_taup),
-                                          default))))
+                                 ak.where(taup_is_dm10, polarimetric_vec_dm10(tau_p_rf, piOS_p_rf, piSS1_p_rf, piSS2_p_rf, +1),
+                                    ak.where(taup_is_dm11, polarimetric_vec_dm11(tau_p_rf, piOS_p_rf, piSS1_p_rf, piSS2_p_rf, pizero_p_rf, +1),
+                                       ak.where(taup_is_leptonic, polarimetric_vec_leptonic(lep_p_rf, bv_taup),
+                                             default)))))
 
 
     taun_s = ak.where(taun_is_dm0, polarimetric_vec_dm0(piOS_n_rf, bv_taun),
                         ak.where(taun_is_dm1or2, polarimetric_vec_dm1(piOS_n_rf, pizero_n_rf, tau_n_rf, bv_taun),
-                                 ak.where(taun_is_dm10 | taun_is_dm11, polarimetric_vec_dm10(tau_n_rf, piOS_n_rf, piSS1_n_rf, piSS2_n_rf, -1),
-                                    ak.where(taun_is_leptonic, polarimetric_vec_leptonic(lep_n_rf, bv_taun),
-                                          default))))
+                                 ak.where(taun_is_dm10, polarimetric_vec_dm10(tau_n_rf, piOS_n_rf, piSS1_n_rf, piSS2_n_rf, -1),
+                                    ak.where(taun_is_dm11, polarimetric_vec_dm11(tau_n_rf, piOS_n_rf, piSS1_n_rf, piSS2_n_rf, pizero_n_rf, -1),
+                                       ak.where(taun_is_leptonic, polarimetric_vec_leptonic(lep_n_rf, bv_taun),
+                                             default)))))
 
     return taup_s, spatial(tau_p_rf).unit(), taun_s, spatial(tau_n_rf).unit()
