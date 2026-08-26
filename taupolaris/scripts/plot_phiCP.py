@@ -61,10 +61,6 @@ options = {
         'label': 'TauPolaris',
         'tag':   'RecoNu_Smeared_TS',
     },
-    'recoNu_hybrid': {
-        'label': 'TauPolaris',
-        'tag':   'RecoNu_Smeared_Hybrid',
-    },
     'recoPolvec': {
         'label': 'Polarimetric Vector (Flow, direct)',
         'tag':   'PolVecDirect',
@@ -265,16 +261,6 @@ def compute_phicp_all(df, option, use_map=True, output_dir='.'):
         R2 = ak.zip({"x": hh_m[:, 0], "y": hh_m[:, 1], "z": hh_m[:, 2]}, with_name="Vector3D")
         #TODO need to study how to deal with the nans properly, for now we just use the old R1/R2 for those events
         phiCP = compute_aco_polarimetric(R1, P1, R2, P2)
-    elif option == 'recoNu_hybrid':
-        # DM=11 (3h+pi0) used to need a per-event tauola (_run_hh_loop) override here,
-        # since get_ditau_polarimetric only had the DM=10 (a1) approximation for it.
-        # get_ditau_polarimetric now computes DM=11 exactly via the vectorised
-        # Polarimetric3hpi0 (see acoplanarity_tools.polarimetric_vec_dm11), so this
-        # option is now equivalent to 'recoNu' -- kept as a separate name for
-        # backwards-compat with existing configs/plots.
-        tau_prefix = 'map_pred' if use_map else 'pred'
-        R1, P1, R2, P2 = get_ditau_polarimetric(df, tau_prefix=tau_prefix, reco_pions=True)
-        phiCP = compute_aco_polarimetric(R1, P1, R2, P2)
     elif option == 'recoRun3':
         R1, P1, leg1_is_dp = get_R_P_vectors_all(df, tau_prefix='taup', use_map=use_map)
         R2, P2, leg2_is_dp = get_R_P_vectors_all(df, tau_prefix='taun', use_map=use_map)
@@ -402,7 +388,7 @@ def load_data(prefix='', extra_pt_cut=-1, uncorrelated=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--option', choices=['gen', 'gen_ts', 'recoRun3', 'recoNu', 'recoNu_ts', 'recoNu_hybrid', 'recoPolvec'],
+    parser.add_argument('-o', '--option', choices=['gen', 'gen_ts', 'recoRun3', 'recoNu', 'recoNu_ts', 'recoPolvec'],
                         default='gen', help="Reconstruction method to use.")
     parser.add_argument('--output-dir', default='.', help="Directory for output PDFs.")
     parser.add_argument('--useMLP', action='store_true')
@@ -452,13 +438,23 @@ def main():
             zprime_df = add_or_get_DM(zprime_df, dm_prefix=dm_pfx)
             zprime_df = compute_phicp_all(zprime_df, args.option, use_map=use_map)
 
+    # DM=11 (3h+pi0) is only meaningful for options whose polarimetric-vector computation
+    # actually has a DM=11 branch. get_ditau_polarimetric (used by 'gen'/'recoNu') and the
+    # tauola-loop options ('gen_ts'/'recoNu_ts') all handle it correctly. 'recoRun3' does
+    # not -- get_R_P_vectors_all/compute_aco_classic_a1a1 in acoplanarity_tools.py have no
+    # DM=11 case, so DM=11 events would silently fall through to the wrong P/R vectors
+    # (e.g. a single charged-pion momentum instead of the full 3-prong tau momentum) rather
+    # than erroring -- so DM=11 must stay excluded there. 'recoPolvec' is left out too since
+    # it's not confirmed the underlying flow model was trained/evaluated on DM=11 legs.
+    supports_dm11 = args.option in ('gen', 'gen_ts', 'recoNu', 'recoNu_ts')
+
     if args.leptonic_mode == 1:
         dm_combs = [[100, 0], [100,1], [100,2], [100,10]]
-        if args.option in ('gen_ts', 'recoNu_ts', 'recoNu_hybrid'):
+        if supports_dm11:
             dm_combs += [[100, 11]]
-    else: 
+    else:
         dm_combs = [[0, 0], [0,1], [1,1], [2,2], [1,2], [0,2], [10,10], [0,10], [1,10], [2,10]]
-        if args.option in ('gen_ts', 'recoNu_ts', 'recoNu_hybrid'):
+        if supports_dm11:
             dm_combs += [[0, 11], [1,11], [2,11], [10,11], [11,11]]
 
     asymmetry_dict = {}
