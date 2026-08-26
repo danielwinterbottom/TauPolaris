@@ -266,23 +266,14 @@ def compute_phicp_all(df, option, use_map=True, output_dir='.'):
         #TODO need to study how to deal with the nans properly, for now we just use the old R1/R2 for those events
         phiCP = compute_aco_polarimetric(R1, P1, R2, P2)
     elif option == 'recoNu_hybrid':
+        # DM=11 (3h+pi0) used to need a per-event tauola (_run_hh_loop) override here,
+        # since get_ditau_polarimetric only had the DM=10 (a1) approximation for it.
+        # get_ditau_polarimetric now computes DM=11 exactly via the vectorised
+        # Polarimetric3hpi0 (see acoplanarity_tools.polarimetric_vec_dm11), so this
+        # option is now equivalent to 'recoNu' -- kept as a separate name for
+        # backwards-compat with existing configs/plots.
         tau_prefix = 'map_pred' if use_map else 'pred'
         R1, P1, R2, P2 = get_ditau_polarimetric(df, tau_prefix=tau_prefix, reco_pions=True)
-        dm_p_arr = np.array(df['taup_DM'])
-        dm_m_arr = np.array(df['taun_DM'])
-        needs_ts = (dm_p_arr == 11) | (dm_m_arr == 11)
-        hh_p, hh_m, _, _ = _run_hh_loop(df, tau_prefix=tau_prefix, pion_prefix='reco', fix_tau_mass=False, event_mask=needs_ts)
-        r1_arr = np.stack([np.array(R1.x), np.array(R1.y), np.array(R1.z)], axis=1)
-        r2_arr = np.stack([np.array(R2.x), np.array(R2.y), np.array(R2.z)], axis=1)
-        nan_p = np.isnan(hh_p[:, 0])
-        nan_m = np.isnan(hh_m[:, 0])
-        # Replace each leg independently: only swap if that leg is DM=11
-        use_ts_p = (dm_p_arr == 11) & ~nan_p
-        use_ts_m = (dm_m_arr == 11) & ~nan_m
-        r1_arr[use_ts_p] = hh_p[use_ts_p]
-        r2_arr[use_ts_m] = hh_m[use_ts_m]
-        R1 = ak.zip({"x": r1_arr[:, 0], "y": r1_arr[:, 1], "z": r1_arr[:, 2]}, with_name="Vector3D")
-        R2 = ak.zip({"x": r2_arr[:, 0], "y": r2_arr[:, 1], "z": r2_arr[:, 2]}, with_name="Vector3D")
         phiCP = compute_aco_polarimetric(R1, P1, R2, P2)
     elif option == 'recoRun3':
         R1, P1, leg1_is_dp = get_R_P_vectors_all(df, tau_prefix='taup', use_map=use_map)
