@@ -8,16 +8,34 @@ from array import array
 from taupolaris.utils.kinematic_helpers import EntanglementVariables
 import argparse
 import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import mplhep as hep
+
+plt.style.use(hep.style.CMS)
+plt.rcParams.update({"font.size": 18, "axes.labelsize": 18, "xtick.labelsize": 18,
+                      "ytick.labelsize": 18, "legend.fontsize": 18})
+# main.tex loads no special math-font package, so the paper's math is default
+# LaTeX Computer Modern; 'cm' reproduces that here (the CMS style otherwise
+# maps \mathcal etc. to its sans-serif text font, e.g. C wouldn't get the
+# calligraphic C used in the paper for concurrence).
+plt.rcParams['mathtext.fontset'] = 'cm'
+
+# Collaborator's shared palette (models.tex figures).
+bkg_fit_color = '#0072B2'   # Background (Z/gamma* -> tautau)   (== sampled_color)
+sig_fit_color = '#e42536'   # Best-fit signal                    (== pred_color)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=int, help="Determines which model to assume for the signal. 1 = CP-even Higgs, 2 = spin0 no entanglement, 3 = uncorrelated", default=1)
-parser.add_argument("--sig-file", default="outputs_model_LHC_TransformerFlow_Hadronic_100e_June22_TRIAL2/output_results_UnCorr.parquet", help="Sig file for the fully-hadronic (tt) channel.")
-parser.add_argument("--bkg-file", default="outputs_model_LHC_TransformerFlow_Hadronic_100e_June22_TRIAL2/output_results_ZToTauTau.parquet", help="Bkg file for the fully-hadronic (tt) channel.")
-parser.add_argument("--sig-file-sl", default='outputs_model_LHC_TransformerFlow_SemiLeptonic_100e_June24_TRIAL2/output_results_Uncorr_new.parquet', help="Sig file for the semileptonic (mt+et) channels -- mu+tauh and e+tauh both come from the same file, distinguished by reco_taup/taun_ismuon/iselectron. If not provided (together with --bkg-file-sl), mt/et categories are skipped.")
-parser.add_argument("--bkg-file-sl", default='outputs_model_LHC_TransformerFlow_SemiLeptonic_100e_June24_TRIAL2/output_results_ZTT_new.parquet', help="Bkg file for the semileptonic (mt+et) channels.")
+parser.add_argument("--sig-file", default="outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet", help="Sig file for the fully-hadronic (tt) channel.")
+parser.add_argument("--bkg-file", default="outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_Z.parquet", help="Bkg file for the fully-hadronic (tt) channel.")
+parser.add_argument("--sig-file-sl", default='outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_results.parquet', help="Sig file for the semileptonic (mt+et) channels -- mu+tauh and e+tauh both come from the same file, distinguished by reco_taup/taun_ismuon/iselectron. If not provided (together with --bkg-file-sl), mt/et categories are skipped.")
+parser.add_argument("--bkg-file-sl", default='outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_Z.parquet', help="Bkg file for the semileptonic (mt+et) channels.")
 parser.add_argument("--no-replace", action="store_true", help="Sample toys without replacement (non-overlapping chunks). Limits N_toys to the smallest category's pool_size/N_events.")
 parser.add_argument("--n-toys", type=int, default=1000, help="Number of toys to generate. If --no-replace is set, this will be limited by the smallest category's pool.")
-parser.add_argument("--outdir", default="nll_fits_fast_incdm2_v2", help="Directory to write output files to.")
+parser.add_argument("--outdir", default="nll_fits_aug7", help="Directory to write output files to.")
 parser.add_argument("--measure-B", action="store_true", help="Also measure B vector (tau polarization) elements.")
 args = parser.parse_args()
 
@@ -307,23 +325,7 @@ CATEGORIES = [
     {'name': 'ea11pr',   'channel': 'sl', 'gen_mask': _no_gen_cut, 'reco_mask': _dm_pair_mask('e', 'a11pr'),  'N_sig': 428,  'N_bkg': 5082},
 ]
 
-# Old single inclusive category (superseded by the yields_run3-based breakdown
-# above); kept here, fully commented out, for reference:
-#CATEGORIES = [
-#     {
-#         'name': 'dm01_incl',
-#         #'gen_mask': _no_gen_cut,
-#         'gen_mask':  lambda df: (df['true_taup_npizero'] < 2) & (df['true_taun_npizero'] < 2) &
-#                                  (df['true_taup_is3prong'] == 0) & (df['true_taun_is3prong'] == 0),
-#         'reco_mask': lambda df: (df['reco_taup_npizero'] < 2) & (df['reco_taun_npizero'] < 2) &
-#                                  (df['reco_taup_is3prong'] == 0) & (df['reco_taun_is3prong'] == 0),
-#         'N_sig': 1100,
-#         'N_bkg': 2100,
-#     },
-#]
-
 var_prefix = 'map_pred'
-#var_prefix = 'true'
 
 _cut_cols = [
     'reco_taup_npizero', 'reco_taun_npizero', 'reco_taup_is3prong', 'reco_taun_is3prong',
@@ -581,106 +583,80 @@ def _plot_model_shapes(model_hists, vals, xlabel, component_label, outpath, head
     how much the observable's shape actually changes with the fit parameter,
     i.e. the raw discriminating power of the reweighting for this
     variable/category, independent of the Asimov data or background.
-    component_label is the Cij/B name (e.g. 'Cnn', 'Btau+_n'), used in the
-    legend in place of the generic '#rho'. headroom scales the y-axis max so
-    the histogram peak stays clear of the legend (B components need more,
-    since their legend text is longer)."""
+    component_label is the bare mathtext Cij/B name (e.g. 'C_{nn}',
+    'B^{+}_{n}', no surrounding $), used in the legend in place of the
+    generic rho. headroom scales the y-axis max so the histogram peak stays
+    clear of the legend (B components need more, since their legend text is
+    longer)."""
     idx_m1 = 0
     idx_0 = int(np.argmin(np.abs(vals)))
     idx_p1 = len(vals) - 1
 
-    def _to_th1(arr, name):
-        h = ROOT.TH1D(name, "", n_bins, -1, 1)
-        for i, v in enumerate(arr):
-            h.SetBinContent(i + 1, v)
-        return h
+    edges = np.linspace(-1, 1, n_bins + 1)
+    curves = [(model_hists[idx_m1], vals[idx_m1], bkg_fit_color),
+              (model_hists[idx_0],  vals[idx_0],  'black'),
+              (model_hists[idx_p1], vals[idx_p1], sig_fit_color)]
 
-    h_m1 = _to_th1(model_hists[idx_m1], "h_rho_m1")
-    h_0 = _to_th1(model_hists[idx_0], "h_rho_0")
-    h_p1 = _to_th1(model_hists[idx_p1], "h_rho_p1")
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for hist, val, color in curves:
+        ax.step(edges, np.append(hist, hist[-1]), where='post', color=color,
+                linewidth=2, label=f'${component_label} = {val:.2f}$')
 
-    canv = ROOT.TCanvas("canv_shapes", "canv_shapes", 800, 600)
-    for h, color in [(h_m1, ROOT.kBlue), (h_0, ROOT.kBlack), (h_p1, ROOT.kRed)]:
-        h.SetTitle("")
-        h.SetStats(0)
-        h.SetLineWidth(2)
-        h.SetLineColor(color)
-        h.GetXaxis().SetTitle(xlabel)
-        h.GetYaxis().SetTitle("Normalised")
-    ymax = max(h_m1.GetMaximum(), h_0.GetMaximum(), h_p1.GetMaximum()) * headroom
-    h_m1.SetMinimum(0)
-    h_m1.SetMaximum(ymax)
-    h_m1.Draw("hist")
-    h_0.Draw("hist same")
-    h_p1.Draw("hist same")
-    leg = ROOT.TLegend(0.6, 0.7, 0.9, 0.9)
-    leg.AddEntry(h_m1, f"{component_label} = {vals[idx_m1]:.2f}", "l")
-    leg.AddEntry(h_0, f"{component_label} = {vals[idx_0]:.2f}", "l")
-    leg.AddEntry(h_p1, f"{component_label} = {vals[idx_p1]:.2f}", "l")
-    leg.SetBorderSize(0)
-    leg.SetFillStyle(0)
-    leg.Draw()
-    canv.Print(outpath)
-    del h_m1, h_0, h_p1, canv, leg
+    ax.set_ylim(0, max(h.max() for h, _, _ in curves) * headroom)
+    ax.set_xlim(-1, 1)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('Normalised')
+    ax.legend(loc='upper right')
+
+    fig.savefig(outpath, bbox_inches='tight')
+    plt.close(fig)
 
 
-def _np_to_th1(arr, name):
-    h = ROOT.TH1D(name, "", n_bins, -1, 1)
-    h.Sumw2()
-    for i, v in enumerate(arr):
-        h.SetBinContent(i+1, v)
-        h.SetBinError(i+1, np.sqrt(abs(v)))
-    return h
-
-
-def _plot_asimov_overlay(data_counts, bkg_counts, pred_corr_np, xlabel, legend_lines, outpath, headroom=1.2):
+def _plot_asimov_overlay(data_counts, bkg_counts, pred_corr_np, xlabel, legend_lines, outpath, headroom=1.35):
     """Asimov data vs best-fit signal + background overlay for one category/element.
     headroom scales the y-axis max so the histogram content stays clear of the
-    legend (B components need more, since their legend text is longer)."""
-    h_data_root = _np_to_th1(data_counts, "h_data")
-    h_azimov_bkg_root = _np_to_th1(bkg_counts, "h_azimov_bkg")
-    h_pred_corr_root = _np_to_th1(pred_corr_np, "h_pred_corr")
+    legend. The legend uses two columns -- data/background/signal on the
+    left, the fit-result text on the right -- so it needs only as many rows
+    as the taller column (3), not 3+len(legend_lines) (5) as a single column
+    would; figsize is widened so the legend also has clear margin either side
+    at 18pt font, rather than nearly spanning the full axes width."""
+    edges = np.linspace(-1, 1, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    data_err = np.sqrt(np.abs(data_counts))
 
-    canv = ROOT.TCanvas("canv", "canv", 800, 600)
-    h_data_root.SetTitle("")
-    h_data_root.SetStats(0)
-    h_data_root.SetLineColor(ROOT.kBlack)
-    h_data_root.SetLineWidth(2)
-    h_data_root.SetMarkerStyle(20)
-    h_data_root.SetMarkerColor(ROOT.kBlack)
-    h_data_root.GetXaxis().SetTitle(xlabel)
-    h_data_root.GetYaxis().SetTitle("Events")
-    stack_max = h_azimov_bkg_root.GetBinContent(h_azimov_bkg_root.GetMaximumBin()) + \
-                h_pred_corr_root.GetBinContent(h_pred_corr_root.GetMaximumBin())
-    ymax = max(h_data_root.GetMaximum() + h_data_root.GetBinError(h_data_root.GetMaximumBin()), stack_max)
-    h_data_root.SetMinimum(0)
-    h_data_root.SetMaximum(ymax * headroom)
-    h_data_root.Draw("pE1")
-    hs = ROOT.THStack("hs", "")
-    h_pred_corr_root.SetLineColor(ROOT.kBlack)
-    h_pred_corr_root.SetFillColor(ROOT.kRed)
-    h_pred_corr_root.SetLineWidth(1)
-    h_azimov_bkg_root.SetLineColor(ROOT.kBlack)
-    h_azimov_bkg_root.SetFillColor(ROOT.kBlue)
-    h_azimov_bkg_root.SetLineWidth(1)
-    hs.Add(h_azimov_bkg_root)
-    hs.Add(h_pred_corr_root)
-    hs.SetMinimum(0)
-    hs.Draw("hist same")
-    h_data_root.Draw("pE1 same")
-    leg = ROOT.TLegend(0.58, 0.53, 0.9, 0.9)
-    leg.AddEntry(h_data_root, "Asimov Data", "pe")
-    leg.AddEntry(h_azimov_bkg_root, "Background", "f")
-    leg.AddEntry(h_pred_corr_root, "Best-fit signal", "f")
-    leg.SetBorderSize(0)
-    leg.SetFillStyle(0)
-    dummy_hist = ROOT.TH1D("dummy_hist", "", 1, 0, 1)
-    dummy_hist.SetLineColor(ROOT.kWhite)
-    for line in legend_lines:
-        leg.AddEntry(dummy_hist, line, "l")
-    leg.Draw()
-    canv.Print(outpath)
-    del h_data_root, h_pred_corr_root, h_azimov_bkg_root, canv, dummy_hist, leg, hs
+    fig, ax = plt.subplots(figsize=(9.5, 6))
+    # stairs() draws a single connected step outline -- a vertical segment
+    # appears only where the bin content actually changes, not a full
+    # rectangle border per bin (which is what bar() draws, and what produced
+    # the "picket fence" of internal vertical lines between similar-height
+    # bins in the previous version).
+    ax.stairs(bkg_counts, edges, baseline=0, fill=True,
+              facecolor=bkg_fit_color, edgecolor='black', linewidth=1.0, zorder=1)
+    ax.stairs(bkg_counts + pred_corr_np, edges, baseline=bkg_counts, fill=True,
+              facecolor=sig_fit_color, edgecolor='black', linewidth=1.0, zorder=1)
+    # Using the returned ErrorbarContainer (rather than a bare marker) as the
+    # legend handle so the legend swatch itself shows the error bar, not just
+    # the point.
+    data_handle = ax.errorbar(centers, data_counts, yerr=data_err, fmt='o', color='black',
+                               markersize=6, linewidth=1.5, capsize=0, zorder=3,
+                               label='Asimov data')
+
+    stack_max = (bkg_counts + pred_corr_np).max()
+    data_top = (data_counts + data_err).max()
+    ax.set_ylim(0, max(stack_max, data_top) * headroom)
+    ax.set_xlim(-1, 1)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('Counts')
+
+    handles = [
+        data_handle,
+        Patch(facecolor=bkg_fit_color, edgecolor='black', linewidth=0.7, label='Background'),
+        Patch(facecolor=sig_fit_color, edgecolor='black', linewidth=0.7, label='Best-fit signal'),
+    ] + [Patch(color='none', label=line) for line in legend_lines]
+    ax.legend(handles=handles, ncol=2, loc='upper center', borderaxespad=1.0)
+
+    fig.savefig(outpath, bbox_inches='tight')
+    plt.close(fig)
 
 
 C_exp = C_rwt
@@ -717,16 +693,16 @@ for Cij in Cij_elements:
         pred_corr_np = cat['model_hists_per_Cij'][Cij][i_best] * cat['N_sig']
         _plot_asimov_overlay(
             data_counts, bkg_counts, pred_corr_np,
-            f"cos#theta^{{+}}_{{{Cij[0]}}}cos#theta^{{-}}_{{{Cij[1]}}}",
-            [f"Combined-fit C{Cij} = {best_rho:.2f}^{{+{rho_high-best_rho:.2f}}}_{{-{best_rho-rho_low:.2f}}}",
-             f"True C{Cij} = {GetMatrixCoefficient(C_exp, Cij):.2f}"],
+            f"$\\cos\\theta_{{{Cij[0]}}}^{{+}}\\cos\\theta_{{{Cij[1]}}}^{{-}}$",
+            [f"Combined-fit $C_{{{Cij}}} = {best_rho:.2f}^{{+{rho_high-best_rho:.2f}}}_{{-{best_rho-rho_low:.2f}}}$",
+             f"True $C_{{{Cij}}} = {GetMatrixCoefficient(C_exp, Cij):.2f}$"],
             f"{args.outdir}/{cat['name']}_C{Cij}_{model_tag}.pdf",
         )
 
         _plot_model_shapes(
             cat['model_hists_per_Cij'][Cij], vals,
-            f"cos#theta^{{+}}_{{{Cij[0]}}}cos#theta^{{-}}_{{{Cij[1]}}}",
-            f"C{Cij}",
+            f"$\\cos\\theta_{{{Cij[0]}}}^{{+}}\\cos\\theta_{{{Cij[1]}}}^{{-}}$",
+            f"C_{{{Cij}}}",
             f"{args.outdir}/{cat['name']}_C{Cij}_shapes.pdf",
         )
 
@@ -761,16 +737,15 @@ if args.measure_B:
         label_tex = f"B^{{{'+' if which=='p' else '-'}}}_{{{ax}}}"
         print(f"{label}: {best_rho:.3f} (+{rho_high-best_rho:.3f}/-{best_rho-rho_low:.3f})  [true=0, combined over {len(categories)} categories]")
 
-        xlabel = f"cos#theta^{{{'+' if which=='p' else '-'}}}_{{{ax}}}"
+        xlabel = f"$\\cos\\theta_{{{ax}}}^{{{'+' if which=='p' else '-'}}}$"
         i_best = np.argmin(np.abs(vals - best_rho))
         for cat, data_counts, bkg_counts in per_cat_hists_B:
             pred_corr_np = cat['model_hists_per_B'][key][i_best] * cat['N_sig']
             _plot_asimov_overlay(
                 data_counts, bkg_counts, pred_corr_np, xlabel,
-                [f"Combined-fit {label_tex} = {best_rho:.2f}^{{+{rho_high-best_rho:.2f}}}_{{-{best_rho-rho_low:.2f}}}",
-                 f"True {label_tex} = 0.00"],
+                [f"Combined-fit ${label_tex} = {best_rho:.2f}^{{+{rho_high-best_rho:.2f}}}_{{-{best_rho-rho_low:.2f}}}$",
+                 f"True ${label_tex} = 0.00$"],
                 f"{args.outdir}/{cat['name']}_B{which}{ax}_{model_tag}.pdf",
-                headroom=2.0,
             )
             _plot_model_shapes(
                 cat['model_hists_per_B'][key], vals, xlabel, label_tex,
