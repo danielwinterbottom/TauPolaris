@@ -266,7 +266,27 @@ mode's own tokens:
 | 2 | 4 (+ `hcur_alt_`) | 17 |
 
 For `leptonic_mode: 1` only the `tau2` leg gets tokens — `tau1` is leptonic by
-construction and has no hadronic current.
+construction and has no hadronic current, so `type_emb` goes 9 → 10 at level 1 and
+9 → 11 at level 2.
+
+### Semileptonic
+
+Works without special-casing, but the naming shifts under you, so it is worth knowing
+how. Prep writes `taup`/`taun`, because `convert_semileptonic_df` runs later — at the
+train/val/test split, not at prep. That function renames by substring anywhere in the
+column name, so `reco_taup_hcur_re_n` becomes `reco_tau1_hcur_re_n` along with
+everything else, with tau1 always the leptonic leg and tau2 always the hadronic one.
+
+The leptonic leg needs no special handling at prep time either: its pion columns are
+zero, so the visible four-vector is not timelike and the guard zeroes the block. The
+model never builds a token for it in any case.
+
+To enable it, add the 11 (or 22 at level 2) `reco_tau2_hcur_*` names to
+`input_features` in the semileptonic config.
+
+Note `convert_semileptonic_df` shuffles rows before returning
+(`sample(frac=1, random_state=42)`), so positional indexing across that call is
+meaningless — carry an event id if you need to check row-wise behaviour.
 
 The tokens are masked per decay mode, which matters as much as the values:
 
