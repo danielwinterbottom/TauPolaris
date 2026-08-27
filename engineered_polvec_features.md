@@ -182,14 +182,52 @@ per leg at level 1 and 22 at level 2:
 |---|---|---|
 | `{leg}_hcur_re_{n,r,k}` | 3 | real part of the current, unit-normalised |
 | `{leg}_hcur_im_{n,r,k}` | 3 | imaginary part, same normalisation |
-| `{leg}_hcur_logmag` | 1 | log of the current's magnitude |
 | `{leg}_hcur_s1`, `_s2`, `_s3` | 3 | pair invariant masses squared |
 | `{leg}_hcur_m2vis` | 1 | visible mass squared |
 
-**11 numbers per leg.** Direction and magnitude are separated so the network sees an
-O(1) direction rather than a quantity spanning several orders of magnitude — the form
-factors vary a lot across the Dalitz plane (`logmag` median: −0.31 for DM1, 2.15 for
-DM10, 5.37 for DM11).
+**10 numbers per leg.** Only the current's *direction* is passed — see below.
+
+### Why the magnitude is not a feature
+
+`CLVEC`/`CLAXI` are bilinear in (H, H\*) and `h` is a ratio of two such bilinears, so
+
+```
+h(lambda * H) = h(H)    for any complex lambda
+```
+
+exactly. Verified numerically: max |h(lambda H) − h(H)| = 2.8e-16 for lambda = 1000,
+1e-4, 3e^{0.7i} and 0.01e^{-2.1i}. The magnitude carries no information about the
+polarimetric vector at all.
+
+It is redundant a second way too. In the a1 rest frame the current is purely spatial
+(|H_t|/|H| < 1.5e-15, transversality) and its magnitude is exactly rotation-invariant
+(1.7e-14 under a rigid rotation of all three pions), while 3-body kinematics in that
+frame is fixed by the Dalitz variables up to rotation. So |H| is a function of
+`m2vis, s1, s2`, which are already passed. A nearest-neighbour test confirms it: the
+median relative |H| difference between events falls monotonically as they approach each
+other in (m2vis, s1, s2) — 0.20, 0.084, 0.057, 0.025.
+
+**A caveat on what remains.** The same bilinearity means the overall *phase* of the
+current is also unphysical, so the six re/im components still carry one redundant degree
+of freedom. That is left in deliberately: removing it by rotating to the principal axes
+(R·I = 0) needs a discrete sign convention, which would introduce exactly the kind of
+artificial seam that is worth more than the wasted dof. A redundant *input* direction is
+mild — the network can learn to ignore it — unlike a redundant *output* direction, which
+is the measure-zero `onorm` problem and is fatal.
+
+### What each piece is actually for
+
+`h = f(H, a1, tau)`, so given the current and the pion momenta the network already has,
+**nothing else affects h**:
+
+| feature | affects h? | why it is included |
+|---|---|---|
+| `re/im` | **yes** — the entire h-dependence | the Breit-Wigner form factors, genuinely hard to learn |
+| `s1, s2, s3` | no — upstream of H, already consumed by the form factors | Dalitz position; plausibly useful for the tau-momentum output, and tells a density model where the form factors vary fast, i.e. how wide the conditional on H should be |
+| `m2vis` | no | constrains the tau kinematics (theta_GJ^max depends on m_vis) |
+
+Only `re/im` carries content that is hard for the network to reconstruct itself. The
+scalars are cheap conveniences it could form from sums and dot products.
 
 The current is computed in the **visible system's rest frame**, which makes it tau-free.
 The form factors are Lorentz scalars so the frame choice does not affect them. The

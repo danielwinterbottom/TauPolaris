@@ -124,7 +124,7 @@ class ParticleTransformerCondition(nn.Module):
     # engineered hadronic-current features, one block of 11 per leg -- see
     # engineered_polvec_features.md and acoplanarity_tools.hadronic_current_features
     _HCUR_SUFFIXES = ('re_n', 're_r', 're_k', 'im_n', 'im_r', 'im_k',
-                      'logmag', 's1', 's2', 's3', 'm2vis')
+                      's1', 's2', 's3', 'm2vis')
     HCUR_BLOCK_SIZE = len(_HCUR_SUFFIXES)
 
     @classmethod

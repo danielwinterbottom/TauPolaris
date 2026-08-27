@@ -506,7 +506,8 @@ def hadronic_current_features(piOS, piSS1, piSS2, pizero, dm, prefix='', eps=1e-
 
     Returns a dict of (N,) numpy arrays with keys
       {prefix}hcur_re_x/y/z, {prefix}hcur_im_x/y/z : current direction, unit-normalised
-      {prefix}hcur_logmag                          : log of the current's magnitude
+                                                     (the magnitude carries no information -- h is
+                                                     invariant under H -> lambda*H, see below)
       {prefix}hcur_s1/s2/s3                        : pair invariant masses squared
       {prefix}hcur_m2vis                           : visible mass squared
     The re/im components are Cartesian in the visible rest frame; the caller is
@@ -589,16 +590,20 @@ def hadronic_current_features(piOS, piSS1, piSS2, pizero, dm, prefix='', eps=1e-
     for arr in (s1, s2, s3):
         arr[bad] = 0.0
 
+    # Only the DIRECTION of the current matters. CLVEC/CLAXI are bilinear in
+    # (H, H*) and the polarimetric vector is a ratio of two such bilinears, so
+    # h is exactly invariant under H -> lambda*H for any complex lambda (checked
+    # numerically: |h(lambda H) - h(H)| ~ 3e-16). The magnitude is therefore
+    # dropped rather than passed as a feature -- it is also redundant with the
+    # Dalitz scalars below, being a rotation-invariant function of them.
     mag = np.sqrt((re ** 2).sum(1) + (im ** 2).sum(1))
     safe = np.maximum(mag, eps)
     re, im = re / safe[:, None], im / safe[:, None]
-    logmag = np.where(mag > eps, np.log(safe), 0.0)
 
     out = {}
     for i, c in enumerate('xyz'):
         out[f'{prefix}hcur_re_{c}'] = re[:, i]
         out[f'{prefix}hcur_im_{c}'] = im[:, i]
-    out[f'{prefix}hcur_logmag'] = logmag
     out[f'{prefix}hcur_s1'] = s1
     out[f'{prefix}hcur_s2'] = s2
     out[f'{prefix}hcur_s3'] = s3
