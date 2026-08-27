@@ -2,6 +2,7 @@ collider: LHC # options so far: are LEP and LHC
 
 SetupNN:
   model_name: model_LHC_TransformerFlow_PolVecDirect_Hadronic_Weighted_onorm_Aug17
+  model_name: model_LHC_TransformerFlow_PolVecDirect_Hadronic_Weighted_onorm_Aug26
   reload: False # load existing model if True, otherwise train new model
   reload_scheduler: False # whether to reload the scheduler state when reloading a model
   n_epochs: 100
