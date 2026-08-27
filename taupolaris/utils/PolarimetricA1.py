@@ -1,5 +1,21 @@
+from __future__ import annotations
+
 import numpy as np
-from ROOT import TLorentzVector, TComplex
+
+# ROOT is needed only by the scalar, single-event PolarimetricA1 class below.
+# PolarimetricA1_vectorised -- the one every production code path actually uses
+# (kinematic_helpers.polarimetric_vector_a1, acoplanarity_tools.polarimetric_vec_dm10)
+# -- is pure numpy and touches neither TLorentzVector nor TComplex. Importing
+# ROOT unconditionally at module scope therefore made the vectorised class
+# unusable in environments without a matching ROOT build (e.g. the conda env
+# used for training, whose Python version differs from ROOT's), for no reason.
+# `from __future__ import annotations` above keeps the TLorentzVector
+# annotations on the scalar class from being evaluated at class-creation time.
+try:
+    from ROOT import TLorentzVector, TComplex
+except ImportError:  # ROOT unavailable -- only the scalar class is affected
+    TLorentzVector = TComplex = None
+
 
 class PolarimetricA1:
     def __init__(self,
@@ -521,14 +537,32 @@ class PolarimetricA1_vectorised:
         self.systType       =  "UP"
 
 
-    def PVC(self) -> 'Vec4':
-        P  = self.p4_tau
+    def hadronic_current(self):
+        """The a1 -> 3pi hadronic current, and the Dalitz scalars it is built from.
+
+        Depends ONLY on the three pion 4-momenta -- no tau and no neutrino enter
+        anywhere below. That is the whole reason this is split out of PVC(): the
+        polarimetric vector factorises as h = f(hadronic current, visible, tau),
+        so this method returns the complete *visible* half of the calculation and
+        can be used as an engineered input feature (see
+        acoplanarity_tools.hadronic_current_features).
+
+        Because the form factors are Lorentz scalars and vec1/vec2/vec3 are
+        covariant, this may be evaluated in any frame; the caller chooses. PVC()
+        calls it with the pions in the tau rest frame (its own convention), while
+        the feature code calls it in the a1 rest frame so the result is tau-free.
+
+        Returns (HADCUR, scalars):
+          HADCUR  : list of 4 complex arrays, ordered [t, x, y, z]
+          scalars : dict with s1, s2, s3 (pair invariant masses squared -- s1 and
+                    s2 are the two opposite-sign/same-sign rho candidates, s3 the
+                    same-sign pair, which has no resonance) and m2_vis = m^2(a1).
+        """
         q1 = self.p4_ss1_pi
         q2 = self.p4_ss2_pi
         q3 = self.p4_os_pi
 
         a1 = q1 + q2 + q3
-        N  = P - a1
 
         s1 = (q2 + q3).M2()
         s2 = (q1 + q3).M2()
@@ -549,6 +583,14 @@ class PolarimetricA1_vectorised:
             vec1.y * F1 + vec2.y * F2 + vec3.y * F3,
             vec1.z * F1 + vec2.z * F2 + vec3.z * F3,
         ]
+        return HADCUR, {'s1': s1, 's2': s2, 's3': s3, 'm2_vis': a1_m2}
+
+    def PVC(self) -> 'Vec4':
+        P  = self.p4_tau
+        a1 = self.p4_ss1_pi + self.p4_ss2_pi + self.p4_os_pi
+        N  = P - a1
+
+        HADCUR, _ = self.hadronic_current()
         HADCURC = [np.conj(h) for h in HADCUR]
 
         CLV = self._CLVEC(HADCUR, HADCURC, N)

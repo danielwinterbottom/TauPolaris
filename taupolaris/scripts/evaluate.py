@@ -7,7 +7,7 @@ import uproot
 import numpy as np
 from tqdm import tqdm
 from taupolaris.python.NN_Tools import load_model, get_device, is_legacy_pizero_proj_checkpoint
-from taupolaris.python.DataProcessing import get_test_dataset
+from taupolaris.python.DataProcessing import _resolve_polvec_feature_level, get_test_dataset
 from taupolaris.utils.coordinate_conversions import convert_coordinates_pred
 from taupolaris.python.Evaluation_Tools import flow_map_predict, compute_spin_vars, save_sampled_pdfs, plot_spin_density_matrix
 from taupolaris.utils.kinematic_helpers import compute_spin_density_vars, add_energies_pair, add_energy, inv_mass
@@ -108,7 +108,8 @@ def main():
     if legacy_pizero_proj:
         print(">> Checkpoint predates the pizero_proj/final-LayerNorm architecture change; "
               "building the matching (older) model architecture.")
-    model = load_model(hp, input_features, output_features, batch_norm=False, useMLP=args.useMLP, useTransformer=is_transformer, useTransformerMLP=args.useTransformerBaseline, leptonic_mode=leptonic_mode, legacy_pizero_proj=legacy_pizero_proj)
+    model = load_model(hp, input_features, output_features, batch_norm=False, useMLP=args.useMLP, useTransformer=is_transformer, useTransformerMLP=args.useTransformerBaseline, leptonic_mode=leptonic_mode, legacy_pizero_proj=legacy_pizero_proj,
+                       polvec_feature_level=_resolve_polvec_feature_level(data_config))
     model.load_state_dict(state_dict)
     print(">> Successfully loaded model")
     model.eval()

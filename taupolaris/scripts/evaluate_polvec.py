@@ -39,7 +39,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from taupolaris.python.DataProcessing import RegressionDataset, get_test_dataset
+from taupolaris.python.DataProcessing import RegressionDataset, get_test_dataset, _resolve_polvec_feature_level
 from taupolaris.python.NN_Tools import load_model, get_device, is_legacy_pizero_proj_checkpoint
 from taupolaris.python.Evaluation_Tools import flow_map_predict, plot_spin_density_matrix
 from taupolaris.utils.coordinate_conversions import (
@@ -340,7 +340,8 @@ def main():
               "building the matching (older) model architecture.")
     model = load_model(nn_config['hyperparams'], input_features, output_features,
                         useTransformer=nn_config.get('use_transformer', True), leptonic_mode=leptonic_mode,
-                        legacy_pizero_proj=legacy_pizero_proj)
+                        legacy_pizero_proj=legacy_pizero_proj,
+                        polvec_feature_level=_resolve_polvec_feature_level(data_config))
     model.load_state_dict(state_dict)
     model.float().to(device)
     model.eval()

@@ -473,3 +473,211 @@ def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=Tr
                                              default)))))
 
     return taup_s, spatial(tau_p_rf).unit(), taun_s, spatial(tau_n_rf).unit()
+
+
+def polarimetric_vec_visible_only(piOS, piSS1, piSS2, pizero, dm, taucharge, eps=1e-6):
+    """
+    Polarimetric vector estimated from the VISIBLE decay products alone -- no
+    neutrino, no tau reconstruction, no secondary vertex.
+
+    This is the eps -> 0 ("ghost neutrino") limit of the exact per-decay-mode
+    formulas. Writing the tau as P = visible + eps*n_hat with n_hat a null
+    4-vector along the visible direction, the neutrino is N = P - visible =
+    eps*n_hat. In every formula used here the neutrino enters only linearly:
+
+      DM1/2  (polarimetric_vec_dm1)  numerator 2(q.N)q - q^2 N
+                                     denominator 2(q.N)(q.P) - q^2 (N.P)
+      DM10/11 (PolarimetricA1 / Polarimetric3hpi0)
+                                     CLVEC/CLAXI are linear in N, and both
+                                     omega = P.(CLV-CLA) and the numerator
+                                     M^2(P)(CLA-CLV) - P(P.(CLA-CLV)) inherit it
+
+    so eps cancels between numerator and denominator and the limit is finite,
+    depending only on the ghost DIRECTION. The leftover 1/M(P) is a positive
+    scale that disappears under unit-normalisation, which is also why it does
+    not matter that M(P) -> m_visible rather than m_tau in the limit.
+
+    The eps -> 0 limit flips the sign of the denominator relative to the
+    exact (real-tau) case, so an overall minus sign is applied here to keep the
+    same orientation convention as the stored TauSpinner ts_hh_* truth.
+
+    Inputs are Momentum4D awkward arrays in a common frame (the function boosts
+    into the visible system's rest frame itself, so pass them in whichever frame
+    the result should be referenced to -- e.g. the ditau/visible-visible rest
+    frame, matching the two-step convention ts_hh_* is defined in).
+
+    piOS is the charged pion of opposite charge to the tau (1-prong: the single
+    pion); piSS1/piSS2 are the two same-charge pions for 3-prong and are ignored
+    otherwise; pizero is the leading pi0 and is ignored for DM0/DM10.
+
+    dm: per-event decay-mode code (0/1/2/10/11), same convention as add_DM.
+    taucharge: +1/-1 array (or scalar).
+
+    Returns an (N,3) numpy array of unit vectors. DM0 legs get the pion
+    direction in the visible rest frame, which is the exact answer for that mode
+    and needs no limit.
+
+    Note eps is a numerical stand-in for the limit, not a physical parameter --
+    results are stable across eps = 1e-2 ... 1e-6 (median direction identical to
+    3 decimal places; the direction flips for <0.01% of legs, where the
+    denominator passes through zero).
+    """
+    dm = np.asarray(dm)
+    is3 = (dm == 10) | (dm == 11)
+    has_pi0 = (dm == 1) | (dm == 2) | (dm == 11)
+
+    zero_pi0 = pizero * 0.0
+    pi0_used = ak.with_name(ak.where(has_pi0, pizero, zero_pi0), "Momentum4D")
+    vis = ak.with_name(
+        ak.where(is3, piOS + piSS1 + piSS2 + pi0_used, piOS + pi0_used), "Momentum4D"
+    )
+
+    v_hat = spatial(vis).unit()
+    ghost = ak.zip({"px": v_hat.x * eps, "py": v_hat.y * eps, "pz": v_hat.z * eps,
+                    "E": ak.ones_like(v_hat.x) * eps}, with_name="Momentum4D")
+    tau = ak.with_name(vis + ghost, "Momentum4D")
+    bv = boost_vec(tau)
+
+    h = ak.where(
+        dm == 0, polarimetric_vec_dm0(piOS, bv),
+        ak.where(dm == 11, polarimetric_vec_dm11(tau, piOS, piSS1, piSS2, pizero, taucharge),
+            ak.where(dm == 10, polarimetric_vec_dm10(tau, piOS, piSS1, piSS2, taucharge),
+                polarimetric_vec_dm1(piOS, pizero, tau, bv))))
+
+    out = np.stack([ak.to_numpy(h.x), ak.to_numpy(h.y), ak.to_numpy(h.z)], axis=1)
+    # DM0 is exact and already carries the right orientation; the eps -> 0 limit
+    # of the other modes needs the sign flip described above.
+    flip = np.where(dm == 0, 1.0, -1.0)[:, None]
+    out = out * flip
+    return out / np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-12)
+
+
+def hadronic_current_features(piOS, piSS1, piSS2, pizero, dm, prefix='', eps=1e-12):
+    """Engineered visible-side input features for polarimetric-vector regression.
+
+    The polarimetric vector factorises exactly as
+
+        h  =  f( hadronic current , visible 4-vector , tau 4-vector )
+              \\_____ computed from the decay products alone _____/   \\_ unknown _/
+
+    so the hadronic current is the *complete* visible half of the calculation --
+    everything about the hadronic system that h can possibly depend on. It is
+    also the expensive half to learn: for DM10 it carries the F3PI rho/rho'/rho''
+    Breit-Wigner form factors across the Dalitz plane, and for DM11 the CLEO
+    4-pion current. Handing it to the network means it only has to learn the
+    contraction with the neutrino, not the resonance dynamics.
+
+    This adds NO information -- it is a deterministic function of pion momenta
+    the network already receives. Its value is purely as an inductive bias.
+
+    Everything is evaluated in the VISIBLE system's rest frame, which makes the
+    result tau-free (the form factors are Lorentz scalars, so the frame choice
+    does not affect them; only the current's components are frame-dependent).
+
+    Per decay mode:
+      DM0        no hadronic current exists (h is just the pion direction) -> zeros
+      DM1/DM2    the current is q = pi - pi0, real, the direct analogue of the
+                 3-prong pairwise differences below
+      DM10       PolarimetricA1_vectorised.hadronic_current()
+      DM11       Polarimetric3hpi0_vectorised.hadronic_current()
+
+    Returns a dict of (N,) numpy arrays with keys
+      {prefix}hcur_re_x/y/z, {prefix}hcur_im_x/y/z : current direction, unit-normalised
+      {prefix}hcur_logmag                          : log of the current's magnitude
+      {prefix}hcur_s1/s2/s3                        : pair invariant masses squared
+      {prefix}hcur_m2vis                           : visible mass squared
+    The re/im components are Cartesian in the visible rest frame; the caller is
+    expected to project them onto the per-tau (n,r,k) basis alongside everything
+    else (see DataProcessing._process_chunk).
+    """
+    from taupolaris.utils.PolarimetricA1 import PolarimetricA1_vectorised
+    from taupolaris.utils.Polarimetric3hpi0 import Polarimetric3hpi0_vectorised
+
+    dm = np.asarray(dm)
+    n_ev = len(dm)
+    is3 = (dm == 10) | (dm == 11)
+    has_pi0 = (dm == 1) | (dm == 2) | (dm == 11)
+
+    zero_pi0 = pizero * 0.0
+    pi0_used = ak.with_name(ak.where(has_pi0, pizero, zero_pi0), "Momentum4D")
+    vis = ak.with_name(ak.where(is3, piOS + piSS1 + piSS2 + pi0_used,
+                                piOS + pi0_used), "Momentum4D")
+    # m^2 is a Lorentz invariant, so take it in the lab -- no boost needed, and
+    # boosting first would lose the rows guarded against below.
+    m2vis = (ak.to_numpy(vis.E) ** 2 - ak.to_numpy(vis.px) ** 2
+             - ak.to_numpy(vis.py) ** 2 - ak.to_numpy(vis.pz) ** 2)
+    # A single high-momentum pion can come out marginally spacelike from float
+    # cancellation in E^2 - p^2 (~0.06% of DM0 legs). Boosting to the "rest
+    # frame" of a spacelike vector gives NaN, so neutralise the boost on those
+    # rows; their current is zeroed at the end regardless.
+    timelike = m2vis > eps
+    _E, _px, _py, _pz = (ak.to_numpy(vis.E), ak.to_numpy(vis.px),
+                         ak.to_numpy(vis.py), ak.to_numpy(vis.pz))
+    vis_safe = ak.zip({'px': np.where(timelike, _px, 0.0),
+                       'py': np.where(timelike, _py, 0.0),
+                       'pz': np.where(timelike, _pz, 0.0),
+                       'E': np.where(timelike, _E, 1.0)}, with_name="Momentum4D")
+    m2vis = np.maximum(m2vis, 0.0)
+
+    bv = boost_vec(vis_safe)
+    rf = {k: boost4(v, bv) for k, v in
+          (('os', piOS), ('ss1', piSS1), ('ss2', piSS2), ('pi0', pizero))}
+    vis_rf = boost4(vis_safe, bv)
+
+    re = np.zeros((n_ev, 3))
+    im = np.zeros((n_ev, 3))
+    s1 = np.zeros(n_ev); s2 = np.zeros(n_ev); s3 = np.zeros(n_ev)
+
+    # --- 1-prong + pi0: the current is q = pi - pi0 (real) ---
+    m1 = (dm == 1) | (dm == 2)
+    if m1.any():
+        q = rf['os'] - rf['pi0']
+        re[m1, 0] = ak.to_numpy(q.px)[m1]
+        re[m1, 1] = ak.to_numpy(q.py)[m1]
+        re[m1, 2] = ak.to_numpy(q.pz)[m1]
+        rho = rf['os'] + rf['pi0']
+        s1[m1] = (ak.to_numpy(rho.E) ** 2 - ak.to_numpy(rho.px) ** 2
+                  - ak.to_numpy(rho.py) ** 2 - ak.to_numpy(rho.pz) ** 2)[m1]
+
+    # --- 3-prong (DM10) and 3-prong + pi0 (DM11) ---
+    for mask, cls, args in (
+        (dm == 10, PolarimetricA1_vectorised,
+         lambda: (vis_rf, rf['os'], rf['ss1'], rf['ss2'], np.ones(n_ev))),
+        (dm == 11, Polarimetric3hpi0_vectorised,
+         lambda: (vis_rf, rf['os'], rf['ss1'], rf['ss2'], rf['pi0'], np.ones(n_ev))),
+    ):
+        if not mask.any():
+            continue
+        # the first argument is the tau; hadronic_current() never touches it, so
+        # the visible 4-vector is passed purely to satisfy the constructor
+        H, sc = cls(*args()).hadronic_current()
+        for i, comp in enumerate((1, 2, 3)):  # H is ordered [t, x, y, z]
+            re[mask, i] = np.real(H[comp])[mask]
+            im[mask, i] = np.imag(H[comp])[mask]
+        s1[mask] = np.asarray(sc['s1'])[mask]
+        s2[mask] = np.asarray(sc['s2'])[mask]
+        s3[mask] = np.asarray(sc['s3'])[mask]
+
+    # rows whose visible system was not timelike (see above), or where anything
+    # came out non-finite, carry no usable current
+    bad = ~timelike | ~np.isfinite(re).all(axis=1) | ~np.isfinite(im).all(axis=1)
+    re[bad] = 0.0
+    im[bad] = 0.0
+    for arr in (s1, s2, s3):
+        arr[bad] = 0.0
+
+    mag = np.sqrt((re ** 2).sum(1) + (im ** 2).sum(1))
+    safe = np.maximum(mag, eps)
+    re, im = re / safe[:, None], im / safe[:, None]
+    logmag = np.where(mag > eps, np.log(safe), 0.0)
+
+    out = {}
+    for i, c in enumerate('xyz'):
+        out[f'{prefix}hcur_re_{c}'] = re[:, i]
+        out[f'{prefix}hcur_im_{c}'] = im[:, i]
+    out[f'{prefix}hcur_logmag'] = logmag
+    out[f'{prefix}hcur_s1'] = s1
+    out[f'{prefix}hcur_s2'] = s2
+    out[f'{prefix}hcur_s3'] = s3
+    out[f'{prefix}hcur_m2vis'] = m2vis
+    return out

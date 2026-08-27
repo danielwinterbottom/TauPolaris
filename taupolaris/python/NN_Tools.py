@@ -56,7 +56,7 @@ def is_legacy_pizero_proj_checkpoint(state_dict):
     return not any(k.endswith('condition_net.pizero_proj.weight') for k in state_dict)
 
 
-def load_model(hp, input_features, output_features, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, legacy_pizero_proj=False):
+def load_model(hp, input_features, output_features, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, legacy_pizero_proj=False, polvec_feature_level=0):
     if useMLP:
         model = MLP(input_size=len(input_features), output_size=len(output_features), num_blocks=hp['num_blocks'],
                     hidden_size=hp['hidden_size'], activation=nn.GELU())
@@ -80,6 +80,7 @@ def load_model(hp, input_features, output_features, batch_norm=False, useMLP=Fal
                                 num_transformer_layers=hp['num_transformer_layers'],
                                 dropout=hp['dropout'],
                                 legacy_pizero_proj=legacy_pizero_proj,
+                                polvec_feature_level=polvec_feature_level,
                                 num_layers=hp['num_layers'], num_bins=hp['num_bins'],
                                 tail_bound=hp['tail_bound'], hidden_size=hp['hidden_size'],
                                 num_blocks=hp['num_blocks'], activation=nn.GELU())
@@ -94,7 +95,7 @@ def load_model(hp, input_features, output_features, batch_norm=False, useMLP=Fal
     return model
 
 
-def setup_model_and_training(hp, train_dataset, test_dataset, input_features, output_features, model_name, verbose=True, reload=False, reload_scheduler=False, reset_training=False, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0):
+def setup_model_and_training(hp, train_dataset, test_dataset, input_features, output_features, model_name, verbose=True, reload=False, reload_scheduler=False, reset_training=False, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, polvec_feature_level=0):
     train_dataloader = DataLoader(train_dataset, batch_size=hp['batch_size'], shuffle=True)
     test_dataloader = DataLoader(test_dataset, batch_size=hp['batch_size'], shuffle=False)
 
@@ -126,6 +127,7 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
                                 d_model=hp['d_model'], nhead=hp['nhead'],
                                 num_transformer_layers=hp['num_transformer_layers'],
                                 dropout=hp['dropout'],
+                                polvec_feature_level=polvec_feature_level,
                                 num_layers=hp['num_layers'], num_bins=hp['num_bins'],
                                 tail_bound=hp['tail_bound'], hidden_size=hp['hidden_size'],
                                 num_blocks=hp['num_blocks'], activation=nn.GELU())

@@ -405,6 +405,13 @@ def _process_chunk(df, config, collider, use_reco, prefix, charged_name, has_ts_
                 out_prefix=None, drop_xyz=False, keep_basis=False,
             )
 
+    # engineered visible-side polarimetric features -- opt-in, see
+    # _add_hadronic_current_features
+    _polvec_feature_level = _resolve_polvec_feature_level(config)
+    if _polvec_feature_level > 0:
+        df = _add_hadronic_current_features(df, prefix, charged_name,
+                                            level=_polvec_feature_level)
+
     return df.reset_index(drop=True)
 
 
@@ -586,6 +593,99 @@ def convert_semileptonic_df(df):
     df_out = df_out.sample(frac=1, random_state=42).reset_index(drop=True)
 
     return df_out
+
+
+def _resolve_polvec_feature_level(config):
+    """Data.engineered_polvec_features -> integer level.
+
+      0 / false : off (default) -- no columns added at all
+      1 / true  : the hadronic current for the leg's OWN reconstructed decay mode
+      2         : level 1, plus the current recomputed under the alternative
+                  "the reconstructed pi0 is spurious" hypothesis
+
+    Level 2 exists for decay-mode misidentification. In these Delphes samples it
+    buys very little -- a leg reconstructed as DM11 is genuinely DM11 98.1% of
+    the time, with only 1.1% really DM10 -- but in full CMS simulation the MVA decay-mode
+    purity for 3pi+pi0 is ~0.70 with ~0.14 leaking in from 3pi, so the alternative
+    hypothesis becomes worth carrying. Kept off by default until then.
+    """
+    level = config.get('engineered_polvec_features', 0)
+    if isinstance(level, bool):
+        return 1 if level else 0
+    return int(level)
+
+
+def _add_hadronic_current_features(df, prefix, charged_name, level=1):
+    """Engineered visible-side polarimetric features (config Data.engineered_polvec_features).
+
+    Adds, per tau leg, the hadronic current and the invariant masses it is built
+    from -- the complete visible half of the polarimetric-vector calculation.
+    See acoplanarity_tools.hadronic_current_features for the physics and for why
+    this adds no information, only an inductive bias.
+
+    level=2 additionally writes a `hcur_alt_` block: the same quantities computed
+    with the reconstructed pi0 dropped, i.e. under the hypothesis that the pi0 is
+    spurious and the leg is really one decay mode lower. This is only
+    non-trivially computable in that direction -- a leg reconstructed WITHOUT a
+    pi0 cannot be re-evaluated as if it had one, because no pi0 four-vector was
+    reconstructed to use. So DM11 -> DM10 is available (and is the case that
+    matters), while DM10 -> DM11 is not.
+
+    Off by default: nothing here runs, and no columns are added, unless the
+    config asks for it, so existing prepared data and trained models are
+    unaffected.
+    """
+    import awkward as ak
+    from taupolaris.utils.acoplanarity_tools import hadronic_current_features
+
+    for tau in ('taup', 'taun'):
+        npizero = df[f'{prefix}{tau}_npizero'].values
+        is3prong = df[f'{prefix}{tau}_is3prong'].values
+        is_lep = df[f'{prefix}{tau}_ishadronic'].values == 0
+        # same DM convention as evaluate.py::_phiCP_dm_codes / plot_phiCP.py::add_DM
+        dm = np.where(is_lep, 100,
+              np.where((is3prong == 1) & (npizero == 0), 10,
+               np.where((is3prong == 1) & (npizero >= 1), 11,
+                np.where(npizero == 0, 0, np.where(npizero == 1, 1, 2)))))
+
+        def M4(name):
+            return ak.zip({c: df[f'{prefix}{tau}_{name}_{c}'].values.astype(float)
+                           for c in ('px', 'py', 'pz')}
+                          | {'E': df[f'{prefix}{tau}_{name}_e'].values.astype(float)},
+                          with_name="Momentum4D")
+
+        blocks = [('hcur_', dm, M4('pizero1'))]
+        if level >= 2:
+            # drop the pi0 and re-evaluate one decay mode lower. -1 is a sentinel
+            # matching no branch in hadronic_current_features, so legs with no pi0
+            # to drop (DM0, DM10) get an all-zero block rather than a duplicate of
+            # the one above.
+            zero_pi0 = ak.zip({c: np.zeros(len(df)) for c in ('px', 'py', 'pz', 'E')},
+                              with_name="Momentum4D")
+            dm_alt = np.where(dm == 11, 10, np.where(np.isin(dm, [1, 2]), 0, -1))
+            blocks.append(('hcur_alt_', dm_alt, zero_pi0))
+
+        for block_prefix, block_dm, block_pi0 in blocks:
+            feats = hadronic_current_features(
+                M4('pi1'), M4('pi2'), M4('pi3'), block_pi0, block_dm,
+                prefix=f'{prefix}{tau}_')
+            # hadronic_current_features always names its outputs hcur_*; rename
+            # for the alternative block so the two do not collide
+            for k, v in feats.items():
+                df[k.replace('hcur_', block_prefix, 1)] = v
+
+            # project the current onto the same per-tau visible-momentum (n,r,k)
+            # basis as every other vector quantity, so it arrives in the
+            # coordinates the model is trained in
+            for part in ('re', 'im'):
+                df = ConvertToOrthonormalNRK(
+                    df, prefix_to_convert=f'{prefix}{tau}_{block_prefix}{part}_',
+                    charged_prefix=f"{prefix}{tau}_{charged_name}_",
+                    pi0_prefix=f"{prefix}{tau}_pizero1_",
+                    out_prefix=None, drop_xyz=True, keep_basis=False,
+                    suffixes=("x", "y", "z"),
+                )
+    return df
 
 
 def _prepare_train_val_test_split(k, config, train_df_path, val_df_path, test_df_path):

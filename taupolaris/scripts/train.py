@@ -1,7 +1,7 @@
 import torch
 import pandas as pd
 import argparse
-from taupolaris.python.DataProcessing import get_train_val_test_datasets
+from taupolaris.python.DataProcessing import get_train_val_test_datasets, _resolve_polvec_feature_level
 from taupolaris.python.NN_Tools import setup_model_and_training, train_model, get_device
 import yaml
 import os
@@ -64,7 +64,8 @@ if __name__ == "__main__":
     print(f"Hyperparameters: {hp}")
 
     # Setup model
-    model, optimizer, train_loader, val_loader, scheduler, es, start_epoch, initial_history = setup_model_and_training(hp, train_dataset, val_dataset, input_features, output_features, nn_config['model_name'], reload=nn_config['reload'], reload_scheduler=nn_config['reload_scheduler'], reset_training=nn_config.get('reset_training', False), batch_norm=False, useMLP=args.useMLP, useTransformer=use_transformer, useTransformerMLP=args.useTransformerBaseline, leptonic_mode=data_config['leptonic_mode'])
+    model, optimizer, train_loader, val_loader, scheduler, es, start_epoch, initial_history = setup_model_and_training(hp, train_dataset, val_dataset, input_features, output_features, nn_config['model_name'], reload=nn_config['reload'], reload_scheduler=nn_config['reload_scheduler'], reset_training=nn_config.get('reset_training', False), batch_norm=False, useMLP=args.useMLP, useTransformer=use_transformer, useTransformerMLP=args.useTransformerBaseline, leptonic_mode=data_config['leptonic_mode'],
+                                                                                                                  polvec_feature_level=_resolve_polvec_feature_level(data_config))
     print("Model and training setup complete.")
 
     # Train — TransformerBaseline uses MSE loss, same as useMLP

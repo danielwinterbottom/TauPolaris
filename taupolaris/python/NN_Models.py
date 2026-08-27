@@ -121,8 +121,18 @@ class ParticleTransformerCondition(nn.Module):
 
     _met_feats = ['reco_met_px', 'reco_met_py']
 
+    # engineered hadronic-current features, one block of 11 per leg -- see
+    # engineered_polvec_features.md and acoplanarity_tools.hadronic_current_features
+    _HCUR_SUFFIXES = ('re_n', 're_r', 're_k', 'im_n', 'im_r', 'im_k',
+                      'logmag', 's1', 's2', 's3', 'm2vis')
+    HCUR_BLOCK_SIZE = len(_HCUR_SUFFIXES)
+
+    @classmethod
+    def _hcur_feats(cls, tau, block):
+        return [f'reco_{tau}_{block}{suf}' for suf in cls._HCUR_SUFFIXES]
+
     def __init__(self, input_features, leptonic_mode, context_dim=256, d_model=64, nhead=4, num_layers=3, dropout=0.0,
-                 legacy_pizero_proj=False):
+                 legacy_pizero_proj=False, polvec_feature_level=0):
         """
         legacy_pizero_proj: checkpoints saved before commit 2a901355 ("add
         Npizero") used pi_proj (4-momentum only, no npizero count, no final
@@ -130,11 +140,26 @@ class ParticleTransformerCondition(nn.Module):
         pizero_proj. Set True to build the matching (older) architecture when
         loading such a checkpoint -- see load_model_auto in NN_Tools.py, which
         detects this from the checkpoint's state_dict keys automatically.
+
+        polvec_feature_level: 0 (default) leaves the architecture exactly as it
+        was, so existing checkpoints load unchanged. 1 adds one extra token per
+        hadronic leg carrying the engineered hadronic-current block; 2 adds a
+        second token per leg for the "the reconstructed pi0 is spurious"
+        alternative. Must match Data.engineered_polvec_features in the config
+        that prepared the data, since the columns have to be present in
+        input_features.
         """
         super().__init__()
         self.leptonic_mode = leptonic_mode
         self.legacy_pizero_proj = legacy_pizero_proj
+        self.polvec_feature_level = int(polvec_feature_level)
         feat_idx = {name: i for i, name in enumerate(input_features)}
+
+        # tau legs that can carry a hadronic current: for leptonic_mode 1 the
+        # tau1 leg is leptonic by construction, so only tau2 ever has one.
+        self._hcur_legs = ('tau2',) if leptonic_mode == 1 else ('taup', 'taun')
+        self._hcur_blocks = ('hcur_', 'hcur_alt_')[:self.polvec_feature_level]
+        self._n_hcur_tokens = len(self._hcur_legs) * len(self._hcur_blocks)
 
         self.met_idx = [feat_idx[f] for f in self._met_feats]
 
@@ -146,6 +171,21 @@ class ParticleTransformerCondition(nn.Module):
         self.lep_proj = nn.Linear(5, d_model)  # lep 4-momentum + ismuon flag
         if not legacy_pizero_proj:
             self.pizero_proj = nn.Linear(5, d_model)  # pizero 4-momentum + npizero count
+
+        if self._n_hcur_tokens:
+            self.hcur_proj = nn.Linear(self.HCUR_BLOCK_SIZE, d_model)
+            self.hcur_idx = {}
+            for block in self._hcur_blocks:
+                for leg in self._hcur_legs:
+                    names = self._hcur_feats(leg, block)
+                    missing = [n for n in names if n not in feat_idx]
+                    if missing:
+                        raise ValueError(
+                            f"polvec_feature_level={self.polvec_feature_level} needs the engineered "
+                            f"hadronic-current columns in input_features, but these are missing: "
+                            f"{missing}. Prepare the data with Data.engineered_polvec_features "
+                            f">= {self.polvec_feature_level} and add the columns to the config.")
+                    self.hcur_idx[(block, leg)] = [feat_idx[n] for n in names]
 
         if leptonic_mode == 0:
             print(">> Using Hadronic Training Embedding")
@@ -167,7 +207,7 @@ class ParticleTransformerCondition(nn.Module):
             self.taun_haspizero_idx = feat_idx['reco_taun_haspizero']
             self.taup_is3prong_idx = feat_idx['reco_taup_is3prong']
             self.taun_is3prong_idx = feat_idx['reco_taun_is3prong']
-            self.type_emb = nn.Embedding(13, d_model)
+            self.type_emb = nn.Embedding(13 + self._n_hcur_tokens, d_model)
 
         elif leptonic_mode == 1:
             print(">> Using SemiLeptonic Training Embedding")
@@ -183,7 +223,7 @@ class ParticleTransformerCondition(nn.Module):
             self.tau2_sv_idx = [feat_idx[f] for f in self._tau2_sv_feats]
             self.tau2_haspizero_idx = feat_idx['reco_tau2_haspizero']
             self.tau2_is3prong_idx = feat_idx['reco_tau2_is3prong']
-            self.type_emb = nn.Embedding(9, d_model)
+            self.type_emb = nn.Embedding(9 + self._n_hcur_tokens, d_model)
 
         elif leptonic_mode == -1:
             print(">> Using Mixed Hadronic/Leptonic Training Embedding")
@@ -214,9 +254,18 @@ class ParticleTransformerCondition(nn.Module):
             self.taun_lep_ip_idx = [feat_idx[f] for f in self._taun_lep_ip_feats]
             self.taup_ismuon_idx = feat_idx['reco_taup_ismuon']
             self.taun_ismuon_idx = feat_idx['reco_taun_ismuon']
-            self.type_emb = nn.Embedding(17, d_model)
+            self.type_emb = nn.Embedding(17 + self._n_hcur_tokens, d_model)
         else:
             raise ValueError(f"Unsupported leptonic_mode: {leptonic_mode}")
+
+        if self._n_hcur_tokens:
+            self._hcur_flag_idx = {}
+            for leg in self._hcur_legs:
+                flags = {'is3prong': getattr(self, f'{leg}_is3prong_idx'),
+                         'haspizero': getattr(self, f'{leg}_haspizero_idx')}
+                if hasattr(self, f'{leg}_ishadronic_idx'):
+                    flags['ishadronic'] = getattr(self, f'{leg}_ishadronic_idx')
+                self._hcur_flag_idx[leg] = flags
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
@@ -242,7 +291,7 @@ class ParticleTransformerCondition(nn.Module):
         B, device = x.shape[0], x.device
 
         if self.leptonic_mode == 0:
-            type_embs = self.type_emb(torch.arange(13, device=device))
+            type_embs = self.type_emb(torch.arange(13 + self._n_hcur_tokens, device=device))
             tokens = torch.stack([
                 self.pi_proj(x[:, self.taup_pi1_idx]) + type_embs[0],
                 self.pi_proj(x[:, self.taun_pi1_idx]) + type_embs[1],
@@ -271,7 +320,7 @@ class ParticleTransformerCondition(nn.Module):
             pad_mask[:, 12] = ~x[:, self.taun_is3prong_idx].bool()  # taun SV
 
         elif self.leptonic_mode == 1:
-            type_embs = self.type_emb(torch.arange(9, device=device))
+            type_embs = self.type_emb(torch.arange(9 + self._n_hcur_tokens, device=device))
             lep_input = torch.cat(
                 [x[:, self.tau1_lep_idx], x[:, self.tau1_ismuon_idx].unsqueeze(-1)], dim=-1
             )
@@ -294,7 +343,7 @@ class ParticleTransformerCondition(nn.Module):
             pad_mask[:, 8] = ~x[:, self.tau2_is3prong_idx].bool()  # tau2 SV
 
         elif self.leptonic_mode == -1:
-            type_embs = self.type_emb(torch.arange(17, device=device))
+            type_embs = self.type_emb(torch.arange(17 + self._n_hcur_tokens, device=device))
             taup_had = x[:, self.taup_ishadronic_idx].bool()
             taun_had = x[:, self.taun_ishadronic_idx].bool()
 
@@ -346,12 +395,51 @@ class ParticleTransformerCondition(nn.Module):
             pad_mask[:, 15] = taup_had  # taup lep IP
             pad_mask[:, 16] = taun_had  # taun lep IP
 
+        if self._n_hcur_tokens:
+            tokens, pad_mask = self._append_hcur_tokens(x, tokens, pad_mask, type_embs)
+
         out = self.transformer(tokens, src_key_padding_mask=pad_mask)
 
         # mean pool over present tokens only
         present = (~pad_mask).float().unsqueeze(-1)
         context = (out * present).sum(dim=1) / present.sum(dim=1)
         return self.output_proj(context)
+
+    def _append_hcur_tokens(self, x, tokens, pad_mask, type_embs):
+        """Append the engineered hadronic-current tokens (see
+        engineered_polvec_features.md). Their type embeddings occupy the slots
+        after the mode's own tokens, which is why type_emb is sized with
+        _n_hcur_tokens added.
+
+        Masking matters here as much as the values do. A DM0 leg has no hadronic
+        current at all -- 10 of the 11 numbers are identically zero -- so an
+        unmasked token would be attended to as though it were a real particle
+        sitting at the origin. The alternative ('the reconstructed pi0 is
+        spurious') block is only ever filled for DM11, since a leg reconstructed
+        without a pi0 has no pi0 four-vector to drop, so it is masked everywhere
+        else.
+        """
+        B, device = x.shape[0], x.device
+        base = tokens.shape[1]
+        new_tokens, new_masks = [], []
+        slot = base
+        for block in self._hcur_blocks:
+            for leg in self._hcur_legs:
+                new_tokens.append(self.hcur_proj(x[:, self.hcur_idx[(block, leg)]]) + type_embs[slot])
+                flags = self._hcur_flag_idx[leg]
+                is3 = x[:, flags['is3prong']].bool()
+                haspi0 = x[:, flags['haspizero']].bool()
+                hadronic = (x[:, flags['ishadronic']].bool() if 'ishadronic' in flags
+                            else torch.ones(B, dtype=torch.bool, device=device))
+                if block == 'hcur_':
+                    present = hadronic & (is3 | haspi0)     # everything except DM0/leptonic
+                else:
+                    present = hadronic & is3 & haspi0       # DM11 only
+                new_masks.append(~present)
+                slot += 1
+        tokens = torch.cat([tokens, torch.stack(new_tokens, dim=1)], dim=1)
+        pad_mask = torch.cat([pad_mask, torch.stack(new_masks, dim=1)], dim=1)
+        return tokens, pad_mask
 
 class TransformerRegressor(nn.Module):
     """Transformer encoder (same tokenisation as ConditionalFlow w/ use_transformer=True)
@@ -395,6 +483,7 @@ class ConditionalFlow(nn.Module):
                  num_transformer_layers=3,
                  dropout=0.0,
                  legacy_pizero_proj=False,
+                 polvec_feature_level=0,
                  **flow_kwargs
     ):
         super().__init__()
@@ -407,6 +496,7 @@ class ConditionalFlow(nn.Module):
                 context_dim=context_dim, d_model=d_model,
                 nhead=nhead, num_layers=num_transformer_layers, dropout=dropout,
                 legacy_pizero_proj=legacy_pizero_proj,
+                polvec_feature_level=polvec_feature_level,
             )
         elif cond_num_blocks == 0:
             print("!! INFO: No conditioning network")
