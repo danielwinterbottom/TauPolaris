@@ -41,6 +41,7 @@ Data:
   tree_name: 'tree'  # name of the tree in the root file
   inc_reco_taus: False
   coordinates: onorm  # options: onorm, onorm_angular (onorm_angular parameterizes the polarimetric-vector outputs as (costheta,phi) instead of the redundant unit-norm-constrained (n,r,k) triplet -- see ConvertNRKToAngular)
+  engineered_polvec_features: 0  # 0 = off; 1 = add the per-leg hadronic current (the visible half of the polarimetric-vector calculation, 11 columns + 1 masked transformer token per hadronic leg); 2 = also add the "reconstructed pi0 is spurious" alternative block (matters for full CMS decay-mode purity, not for Delphes). Data must be re-prepared when changing this -- see engineered_polvec_features.md
   training_weight_columns: ['tauspinner_wt_alpha0', 'tauspinner_wt_alpha90']
   train_fraction: 0.85  # fraction of the dataset to use for training
   val_fraction: 0.10 # fraction of the dataset to use for validation
