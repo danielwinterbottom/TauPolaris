@@ -631,13 +631,21 @@ def _add_hadronic_current_features(df, prefix, charged_name, level=1):
     reconstructed to use. So DM11 -> DM10 is available (and is the case that
     matters), while DM10 -> DM11 is not.
 
+    Every column is accumulated in a dict and attached with a single concat at
+    the end. Assigning them one at a time (and going through
+    ConvertToOrthonormalNRK for the n/r/k projection) meant 32 separate block
+    inserts per chunk at level 1, which trips pandas' "DataFrame is highly
+    fragmented" warning and buries anything else in the prep log.
+
     Off by default: nothing here runs, and no columns are added, unless the
     config asks for it, so existing prepared data and trained models are
     unaffected.
     """
     import awkward as ak
     from taupolaris.utils.acoplanarity_tools import hadronic_current_features
+    from taupolaris.utils.coordinate_conversions import _build_nrk_basis_from_visible_tau
 
+    new_cols = {}
     for tau in ('taup', 'taun'):
         npizero = df[f'{prefix}{tau}_npizero'].values
         is3prong = df[f'{prefix}{tau}_is3prong'].values
@@ -654,6 +662,11 @@ def _add_hadronic_current_features(df, prefix, charged_name, level=1):
                           | {'E': df[f'{prefix}{tau}_{name}_e'].values.astype(float)},
                           with_name="Momentum4D")
 
+        # the same per-tau visible-momentum basis every other vector quantity is
+        # projected onto, so the current arrives in the model's coordinates
+        n_hat, r_hat, k_hat = _build_nrk_basis_from_visible_tau(
+            df, f"{prefix}{tau}_{charged_name}_", f"{prefix}{tau}_pizero1_")
+
         blocks = [('hcur_', dm, M4('pizero1'))]
         if level >= 2:
             # drop the pi0 and re-evaluate one decay mode lower. -1 is a sentinel
@@ -669,23 +682,20 @@ def _add_hadronic_current_features(df, prefix, charged_name, level=1):
             feats = hadronic_current_features(
                 M4('pi1'), M4('pi2'), M4('pi3'), block_pi0, block_dm,
                 prefix=f'{prefix}{tau}_')
-            # hadronic_current_features always names its outputs hcur_*; rename
-            # for the alternative block so the two do not collide
-            for k, v in feats.items():
-                df[k.replace('hcur_', block_prefix, 1)] = v
-
-            # project the current onto the same per-tau visible-momentum (n,r,k)
-            # basis as every other vector quantity, so it arrives in the
-            # coordinates the model is trained in
+            base = f'{prefix}{tau}_{block_prefix}'
             for part in ('re', 'im'):
-                df = ConvertToOrthonormalNRK(
-                    df, prefix_to_convert=f'{prefix}{tau}_{block_prefix}{part}_',
-                    charged_prefix=f"{prefix}{tau}_{charged_name}_",
-                    pi0_prefix=f"{prefix}{tau}_pizero1_",
-                    out_prefix=None, drop_xyz=True, keep_basis=False,
-                    suffixes=("x", "y", "z"),
-                )
-    return df
+                v = np.stack([feats[f'{prefix}{tau}_hcur_{part}_{c}'] for c in 'xyz'], axis=1)
+                new_cols[f'{base}{part}_n'] = np.sum(v * n_hat, axis=1)
+                new_cols[f'{base}{part}_r'] = np.sum(v * r_hat, axis=1)
+                new_cols[f'{base}{part}_k'] = np.sum(v * k_hat, axis=1)
+            for scalar in ('s1', 's2', 's3', 'm2vis'):
+                new_cols[f'{base}{scalar}'] = feats[f'{prefix}{tau}_hcur_{scalar}']
+
+    added = pd.DataFrame(new_cols, index=df.index)
+    clash = [c for c in added.columns if c in df.columns]
+    if clash:
+        df = df.drop(columns=clash)
+    return pd.concat([df, added], axis=1)
 
 
 def _prepare_train_val_test_split(k, config, train_df_path, val_df_path, test_df_path):

@@ -145,15 +145,30 @@ def ConvertToOrthonormalNRK(
     n, r, k = _build_nrk_basis_from_visible_tau(df, charged_prefix, pi0_prefix, eps=eps)
     v = _get_vec(df, prefix_to_convert, suffixes=suffixes)
 
-    df[f"{out_prefix}n"] = np.sum(v * n, axis=1)
-    df[f"{out_prefix}r"] = np.sum(v * r, axis=1)
-    df[f"{out_prefix}k"] = np.sum(v * k, axis=1)
-
+    # Assign the new columns in ONE operation rather than one at a time. Each
+    # single-column assignment on a wide frame is a separate block insert, and
+    # _process_chunk calls this a dozen-odd times per chunk -- enough to trip
+    # pandas' "DataFrame is highly fragmented" PerformanceWarning and flood the
+    # prep log. Same columns, same order, same values.
+    new_cols = {
+        f"{out_prefix}n": np.sum(v * n, axis=1),
+        f"{out_prefix}r": np.sum(v * r, axis=1),
+        f"{out_prefix}k": np.sum(v * k, axis=1),
+    }
     if keep_basis:
         for i, comp in enumerate(["x", "y", "z"]):
-            df[f"{out_prefix}n{comp}"] = n[:, i]
-            df[f"{out_prefix}r{comp}"] = r[:, i]
-            df[f"{out_prefix}k{comp}"] = k[:, i]
+            new_cols[f"{out_prefix}n{comp}"] = n[:, i]
+            new_cols[f"{out_prefix}r{comp}"] = r[:, i]
+            new_cols[f"{out_prefix}k{comp}"] = k[:, i]
+    new_df = pd.DataFrame(new_cols, index=df.index)
+    # concat APPENDS, where the old per-column assignment OVERWROTE, so drop any
+    # pre-existing names first -- otherwise a repeat call on the same prefix
+    # would silently leave duplicate columns behind. (Column order shifts for
+    # overwritten names; everything here is indexed by name, never position.)
+    clash = [c for c in new_df.columns if c in df.columns]
+    if clash:
+        df = df.drop(columns=clash)
+    df = pd.concat([df, new_df], axis=1)
 
     if drop_xyz:
         df = df.drop(columns=[f"{prefix_to_convert}{suffixes[0]}", f"{prefix_to_convert}{suffixes[1]}", f"{prefix_to_convert}{suffixes[2]}"])
