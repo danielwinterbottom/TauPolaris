@@ -31,6 +31,7 @@ import argparse
 import os
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import awkward as ak
 import torch
 import yaml
@@ -98,6 +99,38 @@ def hh_native_prefix(output_features, tau_label):
             if col.startswith('ts_hh') and col.endswith(suffix):
                 return col[:-len(suffix)]
     raise ValueError(f"No ts_hh_* output feature found for tau '{tau_label}' in {output_features}")
+
+
+def columns_needed(data_config, tau_labels, coordinates, leptonic_mode, available):
+    """The subset of the test parquet this script actually touches.
+
+    The prepared dataframes carry ~280 columns; a full evaluation sample is
+    several million rows, so reading all of them costs ~5 GB of which most is
+    never used. Intersected with `available` because many of these are optional
+    (TauSpinner weights, ts_hh_approx_*, the angular columns) and only present
+    depending on how the data was prepared.
+    """
+    t1, t2 = tau_labels
+    cols = set(data_config['Features']['input_features'])
+    cols |= set(data_config['Features']['output_features'][coordinates])
+    cols |= set(cartesian_output_order(tau_labels))
+    for t in tau_labels:
+        cols |= {f'undecayed_{t}_e'}
+        cols |= {f'reco_{t}_charged_p{c}' for c in 'xyz'}
+        cols |= {f'reco_{t}_pizero1_p{c}' for c in 'xyz'}
+        cols |= {f'reco_{t}_npi'}                                   # --oneprong/--threeprong cuts
+        for pre in ('', 'reco_'):                                    # add_DM at gen and reco level
+            cols |= {f'{pre}{t}_{f}' for f in ('ishadronic', 'npizero', 'is3prong')}
+        for hh in ('ts_hh_', 'ts_hh_approx_'):                       # entanglement truth + angular
+            cols |= {f'{hh}{t}_{c}' for c in ('n', 'r', 'k', 'costheta', 'phi', 'norm')}
+    if leptonic_mode == 1:
+        cols |= {f'reco_{t1}_lep_{c}' for c in ('e', 'px', 'py', 'pz')}
+        cols |= {f'reco_{t1}_lep_ip{c}' for c in 'xyz'}
+    _AXES = ('n', 'r', 'k')
+    cols |= {f'tauspinner_wt_alpha{a}' for a in (0, 45, 90)}
+    cols |= {f'wt_hp_{a}' for a in _AXES} | {f'wt_hm_{a}' for a in _AXES}
+    cols |= {f'wt_hp_{a}_hm_{b}' for a in _AXES for b in _AXES}
+    return sorted(cols & set(available))
 
 
 def unit(v):
@@ -321,6 +354,11 @@ def main():
     argparser.add_argument('--num_bins', type=int, default=50)
     argparser.add_argument('--oneprong', action='store_true', help='whether to only evaluate on 1-prong taus only')
     argparser.add_argument('--threeprong', action='store_true', help='whether to only evaluate on events with at least 1 3-prong tau')
+    argparser.add_argument('--resume', action='store_true',
+                           help='reuse cached per-chunk results from a previous run instead of '
+                                'recomputing them, so an interrupted evaluation picks up where it '
+                                'stopped. Caches live in <outdir>/_cache and are keyed by event '
+                                'range, so this is safe to pass always.')
     argparser.add_argument('--n_flow_samples', type=int, default=50,
                             help='number of flow samples per event used to estimate an error on pred_phiCP (circular std)')
     args = argparser.parse_args()
@@ -392,7 +430,12 @@ def main():
     for test_dataset_path, test_output_name in zip(test_datasets, test_output_names):
         print(f">> Evaluating on test dataset {test_dataset_path} (output name: {test_output_name})")
         data_config['test_dataset'] = test_dataset_path
-        dataset, df, _, _ = get_test_dataset(data_config, norm_data, oneprong=args.oneprong, threeprong=args.threeprong)
+        wanted = columns_needed(data_config, tau_labels, coordinates, leptonic_mode,
+                                pq.ParquetFile(test_dataset_path).schema_arrow.names)
+        print(f">> Reading {len(wanted)} of "
+              f"{len(pq.ParquetFile(test_dataset_path).schema_arrow.names)} columns from the test file")
+        dataset, df, _, _ = get_test_dataset(data_config, norm_data, oneprong=args.oneprong,
+                                             threeprong=args.threeprong, columns=wanted)
 
         # max_events <= 0 means "all". Guarding on > 0 matters: the old condition
         # let -1 through to df.iloc[:-1], which silently evaluated on every event
@@ -416,14 +459,40 @@ def main():
         X, _ = dataset[:]
         X = X.to(device)
         print(f">> Running MAP prediction (method={nn_config.get('map_method', 'gradient')})...")
-        #chunk_size = 25000 
-        chunk_size = nn_config.get('chunk_size', 25000 if device.type == 'cpu' else 25000)
-        _, predictions_native = flow_map_predict(
-            model, X, test_dataset=dataset,
-            method=nn_config.get('map_method', 'gradient'),
-            num_draws=nn_config.get('map_num_draws', 100),
-            chunk_size=chunk_size
-        )
+        chunk_size = nn_config.get('chunk_size', 25000)
+
+        # Cached per chunk. MAP over a few million events takes many hours, and if
+        # the process is killed part-way (OOM, a node watchdog) all of it is
+        # otherwise lost. Each chunk is written to _cache as it finishes, so
+        # --resume picks up where the previous run stopped. The checkpoint unit is
+        # the existing chunk_size rather than a separate knob -- it is already the
+        # unit flow_map_predict works in, so a cached chunk is exactly one unit of
+        # its work.
+        cache_dir = os.path.join(output_dir, '_cache', test_output_name)
+        os.makedirs(cache_dir, exist_ok=True)
+        n_events = len(df)
+        block = chunk_size
+        parts = []
+        n_cached = 0
+        for bstart in tqdm(range(0, n_events, block), desc="Processing chunks (MAP)"):
+            bstop = min(bstart + block, n_events)
+            cache_f = os.path.join(cache_dir, f'map_{bstart:09d}_{bstop:09d}.npy')
+            if args.resume and os.path.exists(cache_f):
+                parts.append(np.load(cache_f))
+                n_cached += 1
+                continue
+            _, part = flow_map_predict(
+                model, X[bstart:bstop], test_dataset=dataset,
+                method=nn_config.get('map_method', 'gradient'),
+                num_draws=nn_config.get('map_num_draws', 100),
+                chunk_size=chunk_size
+            )
+            np.save(cache_f, part)
+            parts.append(part)
+        if n_cached:
+            print(f">>   [resume] {n_cached}/{len(parts)} MAP chunks loaded from cache")
+        predictions_native = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+        del parts
         pred_native_df = pd.DataFrame(predictions_native, columns=output_features)
 
         cartesian_cols = cartesian_output_order(tau_labels)
@@ -680,8 +749,30 @@ def main():
               f"(chunk size {err_chunk_size} events, {err_chunk_size * n_fs} rows/call)...")
         pred_phiCP_err = np.empty(len(df))
         n_sample_failures = 0
-        for start in tqdm(range(0, len(df), err_chunk_size), desc="Processing chunks (phiCP uncertainty)"):
-            end = min(start + err_chunk_size, len(df))
+        # cached on the same chunk boundaries as the MAP stage above, for the same
+        # reason -- this draws n_flow_samples per event and is the second expensive
+        # stage, so an interrupted run should not have to redo it. Note the
+        # sampling itself runs at err_chunk_size (chunk_size // n_fs) internally;
+        # the CACHE unit is the coarser chunk_size, which keeps the file count
+        # sane without changing how the work is batched.
+        err_blocks = [(b, min(b + block, n_events)) for b in range(0, n_events, block)]
+        pending = []
+        for bstart, bstop in err_blocks:
+            cache_f = os.path.join(cache_dir, f'phicperr_{bstart:09d}_{bstop:09d}.npy')
+            if args.resume and os.path.exists(cache_f):
+                pred_phiCP_err[bstart:bstop] = np.load(cache_f)
+            else:
+                pending.append((bstart, bstop, cache_f))
+        if len(pending) < len(err_blocks):
+            print(f">>   [resume] {len(err_blocks) - len(pending)}/{len(err_blocks)} phiCP-error "
+                  f"blocks loaded from cache")
+        # explicit (start, end) pairs clamped to the owning block -- deriving end
+        # from len(df) would let a block's last sub-chunk spill into the next
+        # block and recompute events already restored from its cache
+        chunk_ranges = [(st, min(st + err_chunk_size, bstop))
+                        for bstart, bstop, _ in pending
+                        for st in range(bstart, bstop, err_chunk_size)]
+        for start, end in tqdm(chunk_ranges, desc="Processing chunks (phiCP uncertainty)"):
             C = end - start
             # model.sample() occasionally hits a rare, non-reproducible numerical
             # instability in nflows's rational-quadratic spline inverse (an assertion
@@ -715,6 +806,9 @@ def main():
             E_t2_s = np.sqrt(np.sum(p_t2_s ** 2, axis=1) + M_TAU ** 2)
             phiCP_samples = get_phiCP(sample_cart_df, E_t1_s, E_t2_s).reshape(C, n_fs)
             pred_phiCP_err[start:end] = circular_std(phiCP_samples, axis=1)
+
+        for bstart, bstop, cache_f in pending:
+            np.save(cache_f, pred_phiCP_err[bstart:bstop])
 
         if n_sample_failures > 0:
             print(f"  WARNING: flow sampling failed on 5 retries for {n_sample_failures} chunk(s) "

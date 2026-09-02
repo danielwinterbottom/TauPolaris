@@ -926,12 +926,16 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
 
     return train_dataset, val_dataset, input_features, output_features
 
-def get_test_dataset(config, norm_data, oneprong=False, threeprong=False):
+def get_test_dataset(config, norm_data, oneprong=False, threeprong=False, columns=None):
+    """columns: optional list restricting what is read from the test parquet.
+    These files carry ~280 columns and a full evaluation sample is millions of
+    rows, so reading everything costs several GB that the caller mostly does not
+    use. Default None preserves the original read-everything behaviour."""
 
     if oneprong and threeprong:
         raise ValueError("Cannot select both oneprong and threeprong options simultaneously. Please choose one or neither.")
 
-    test_df = pd.read_parquet(config['test_dataset'])
+    test_df = pd.read_parquet(config['test_dataset'], columns=columns)
 
     if oneprong:
         test_df = test_df[(test_df['reco_taup_npi'] == 1) & (test_df['reco_taun_npi'] == 1)]
