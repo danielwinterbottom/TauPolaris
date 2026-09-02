@@ -102,36 +102,122 @@ def hh_native_prefix(output_features, tau_label):
     raise ValueError(f"No ts_hh_* output feature found for tau '{tau_label}' in {output_features}")
 
 
-def _map_over_chunks(model, X, dataset, nn_config, args, cache_dir, n_events, block, chunk_size):
-    """MAP prediction, one cached chunk at a time.
+def phicp_from_cart(cart_df, E_t1, E_t2, tau_labels):
+    """phiCP from a Cartesian polarimetric-vector/tau-momentum frame.
 
-    MAP over a few million events takes many hours, and if the process is killed
-    part-way (OOM, a node watchdog) all of it is otherwise lost. Each chunk is
-    written to cache_dir as it finishes, so --resume picks up where the previous
-    run stopped and --from_cache can build outputs from whatever completed. The
-    checkpoint unit is the existing chunk_size rather than a separate knob -- it
-    is already the unit flow_map_predict works in, so one cached file is exactly
-    one unit of its work.
+    R1=h1/P1=n1 and R2=h2/P2=n2 follow compute_aco_polarimetric's own convention
+    (R1=tau+ polarimetric, P1=tau+ direction in compute_aco_classic_a1a1) -- which
+    physical tau is "1" does not matter as long as the same labelling is used for
+    both the true and predicted vectors being compared.
     """
-    parts, n_cached = [], 0
-    for bstart in tqdm(range(0, n_events, block), desc="Processing chunks (MAP)"):
-        bstop = min(bstart + block, n_events)
-        cache_f = os.path.join(cache_dir, f'map_{bstart:09d}_{bstop:09d}.npy')
-        if args.resume and os.path.exists(cache_f):
-            parts.append(np.load(cache_f))
-            n_cached += 1
+    t1, t2 = tau_labels
+    h1 = cart_df[[f'ts_hh_{t2}_x', f'ts_hh_{t2}_y', f'ts_hh_{t2}_z']].values
+    h2 = cart_df[[f'ts_hh_{t1}_x', f'ts_hh_{t1}_y', f'ts_hh_{t1}_z']].values
+    p_t1 = cart_df[[f'undecayed_{t1}_px', f'undecayed_{t1}_py', f'undecayed_{t1}_pz']].values
+    p_t2 = cart_df[[f'undecayed_{t2}_px', f'undecayed_{t2}_py', f'undecayed_{t2}_pz']].values
+    n2, n1 = tau_directions_com(p_t1, p_t2, E_t1, E_t2)
+    return compute_phiCP(h1, n1, h2, n2)
+
+
+def _predict_over_chunks(model, X, dataset, args, nn_config, cache_dir, n_events, chunk_size,
+                         output_features, coordinates, cols, reco_vis, tau_labels, device):
+    """MAP prediction and the phiCP uncertainty, computed together one chunk at a time.
+
+    Both stages are expensive -- MAP optimises z for n_steps per chunk, and the
+    uncertainty draws n_flow_samples per event -- and together they run for many
+    hours on a full sample. Each chunk's results for BOTH are written to cache_dir
+    as soon as they are ready, which gives two things:
+
+      * --resume restarts from the last completed chunk instead of the beginning
+      * --from_cache sees complete rows for every finished chunk, rather than MAP
+        with the error column still empty, because the two stages advance together
+        rather than one running to completion before the other starts
+
+    Interleaving costs nothing: it is the same work per chunk in the same order,
+    just not split into two passes over the sample.
+
+    n_flow_samples <= 0 skips the uncertainty entirely and leaves it NaN.
+    """
+    onorm_cols, angular_cols, cartesian_cols = cols
+    t1, t2 = tau_labels
+    n_fs = args.n_flow_samples
+    # each sample() call handles (events * n_fs) rows at once, so shrink the
+    # sub-chunk by n_fs to keep each call near MAP's own per-call scale
+    err_chunk_size = max(1, chunk_size // n_fs) if n_fs > 0 else chunk_size
+
+    map_parts = []
+    phicp_err = np.full(n_events, np.nan)
+    n_cached_map = n_cached_err = 0
+
+    for bstart in tqdm(range(0, n_events, chunk_size), desc="Processing chunks (MAP+err)"):
+        bstop = min(bstart + chunk_size, n_events)
+        map_f = os.path.join(cache_dir, f'map_{bstart:09d}_{bstop:09d}.npy')
+        err_f = os.path.join(cache_dir, f'phicperr_{bstart:09d}_{bstop:09d}.npy')
+
+        # ---- MAP ----
+        if args.resume and os.path.exists(map_f):
+            map_parts.append(np.load(map_f))
+            n_cached_map += 1
+        else:
+            _, part = flow_map_predict(
+                model, X[bstart:bstop], test_dataset=dataset,
+                method=nn_config.get('map_method', 'gradient'),
+                num_draws=nn_config.get('map_num_draws', 100),
+                chunk_size=chunk_size,
+            )
+            np.save(map_f, part)
+            map_parts.append(part)
+
+        # ---- phiCP uncertainty for the same events ----
+        if n_fs <= 0:
             continue
-        _, part = flow_map_predict(
-            model, X[bstart:bstop], test_dataset=dataset,
-            method=nn_config.get('map_method', 'gradient'),
-            num_draws=nn_config.get('map_num_draws', 100),
-            chunk_size=chunk_size,
-        )
-        np.save(cache_f, part)
-        parts.append(part)
-    if n_cached:
-        print(f">>   [resume] {n_cached}/{len(parts)} MAP chunks loaded from cache")
-    return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+        if args.resume and os.path.exists(err_f):
+            phicp_err[bstart:bstop] = np.load(err_f)
+            n_cached_err += 1
+            continue
+        for start in range(bstart, bstop, err_chunk_size):
+            end = min(start + err_chunk_size, bstop)
+            C = end - start
+            # model.sample() occasionally hits a rare, non-reproducible numerical
+            # instability in nflows's rational-quadratic spline inverse (an assertion
+            # on a negative discriminant, from FP32 precision near bin-boundary
+            # derivatives for an unlucky random draw) -- not tied to any particular
+            # input event, confirmed by retrying the exact same chunk with fresh
+            # random noise. Retry a few times before giving up on the chunk.
+            samples_norm = None
+            for _ in range(5):
+                try:
+                    with torch.no_grad():
+                        samples_norm = model.sample(num_samples=n_fs, context=X[start:end])
+                    break
+                except AssertionError:
+                    continue
+            if samples_norm is None:
+                phicp_err[start:end] = np.nan
+                continue
+            samples_native = dataset.destandardize_outputs(samples_norm).cpu().numpy().reshape(C * n_fs, -1)
+            samples_native_df = pd.DataFrame(samples_native, columns=output_features)
+            rep = lambda arr: np.repeat(arr[start:end], n_fs, axis=0)
+            sample_cart_df = convert_native_to_cartesian(
+                coordinates, samples_native_df, onorm_cols, angular_cols, cartesian_cols,
+                rep(reco_vis[0]), rep(reco_vis[1]), rep(reco_vis[2]), rep(reco_vis[3]),
+            )
+            p_t1_s = sample_cart_df[[f'undecayed_{t1}_px', f'undecayed_{t1}_py', f'undecayed_{t1}_pz']].values
+            p_t2_s = sample_cart_df[[f'undecayed_{t2}_px', f'undecayed_{t2}_py', f'undecayed_{t2}_pz']].values
+            E_t1_s = np.sqrt(np.sum(p_t1_s ** 2, axis=1) + M_TAU ** 2)
+            E_t2_s = np.sqrt(np.sum(p_t2_s ** 2, axis=1) + M_TAU ** 2)
+            phiCP_samples = phicp_from_cart(sample_cart_df, E_t1_s, E_t2_s, tau_labels).reshape(C, n_fs)
+            phicp_err[start:end] = circular_std(phiCP_samples, axis=1)
+        np.save(err_f, phicp_err[bstart:bstop])
+
+    if n_cached_map or n_cached_err:
+        print(f">>   [resume] {n_cached_map} MAP and {n_cached_err} phiCP-error chunks from cache")
+    n_bad = int(np.isnan(phicp_err).sum()) if n_fs > 0 else 0
+    if n_bad:
+        print(f"  WARNING: flow sampling failed after 5 retries for {n_bad} events; "
+              f"pred_phiCP_err is NaN there.")
+    predictions = np.concatenate(map_parts, axis=0) if len(map_parts) > 1 else map_parts[0]
+    return predictions, phicp_err
 
 
 def contiguous_cached_chunks(cache_dir, kind, n_events):
@@ -539,25 +625,6 @@ def main():
         n_events = len(df)
         block = chunk_size
 
-        if args.from_cache:
-            cached, n_avail = contiguous_cached_chunks(cache_dir, 'map', n_events)
-            if not cached:
-                print(f">> --from_cache: nothing cached in {cache_dir}, skipping {test_output_name}")
-                continue
-            print(f">> --from_cache: {len(cached)} MAP chunks cover {n_avail}/{n_events} events "
-                  f"({100 * n_avail / n_events:.1f}%); building outputs from those")
-            predictions_native = np.concatenate([np.load(f) for _, _, f in cached], axis=0)
-            df = df.iloc[:n_avail].reset_index(drop=True)
-            n_events = n_avail
-        else:
-            X, _ = dataset[:]
-            X = X.to(device)
-            print(f">> Running MAP prediction (method={nn_config.get('map_method', 'gradient')})...")
-            predictions_native = _map_over_chunks(
-                model, X, dataset, nn_config, args, cache_dir, n_events, block, chunk_size)
-
-        pred_native_df = pd.DataFrame(predictions_native, columns=output_features)
-
         cartesian_cols = cartesian_output_order(tau_labels)
         # onorm_cols/angular_cols must match the actual column names of
         # pred_native_df/samples_native_df (built with columns=output_features
@@ -578,6 +645,41 @@ def main():
         reco_t1_pizero  = df[[f'reco_{t1}_pizero1_px', f'reco_{t1}_pizero1_py', f'reco_{t1}_pizero1_pz']].values
         reco_t2_charged = df[[f'reco_{t2}_charged_px', f'reco_{t2}_charged_py', f'reco_{t2}_charged_pz']].values
         reco_t2_pizero  = df[[f'reco_{t2}_pizero1_px', f'reco_{t2}_pizero1_py', f'reco_{t2}_pizero1_pz']].values
+
+        if args.from_cache:
+            cached, n_avail = contiguous_cached_chunks(cache_dir, 'map', n_events)
+            if not cached:
+                print(f">> --from_cache: nothing cached in {cache_dir}, skipping {test_output_name}")
+                continue
+            print(f">> --from_cache: {len(cached)} MAP chunks cover {n_avail}/{n_events} events "
+                  f"({100 * n_avail / n_events:.1f}%); building outputs from those")
+            predictions_native = np.concatenate([np.load(f) for _, _, f in cached], axis=0)
+            df = df.iloc[:n_avail].reset_index(drop=True)
+            reco_t1_charged, reco_t1_pizero = reco_t1_charged[:n_avail], reco_t1_pizero[:n_avail]
+            reco_t2_charged, reco_t2_pizero = reco_t2_charged[:n_avail], reco_t2_pizero[:n_avail]
+            n_events = n_avail
+            # the error chunks advance in step with MAP, so whatever is cached
+            # for these events is complete; anything missing stays NaN
+            pred_phiCP_err = np.full(n_events, np.nan)
+            for cstart, cstop, cf in contiguous_cached_chunks(cache_dir, 'phicperr', n_events)[0]:
+                pred_phiCP_err[cstart:cstop] = np.load(cf)
+            n_have = int(np.isfinite(pred_phiCP_err).sum())
+            print(f">> --from_cache: pred_phiCP_err available for {n_have}/{n_events} events "
+                  f"(never recomputed here)")
+        else:
+            X, _ = dataset[:]
+            X = X.to(device)
+            print(f">> Running MAP prediction (method={nn_config.get('map_method', 'gradient')}) "
+                  f"and phiCP uncertainty together, chunk by chunk...")
+            predictions_native, pred_phiCP_err = _predict_over_chunks(
+                model, X, dataset, args, nn_config, cache_dir, n_events, chunk_size,
+                output_features, coordinates,
+                (onorm_cols, angular_cols, cartesian_cols),
+                (reco_t1_charged, reco_t1_pizero, reco_t2_charged, reco_t2_pizero),
+                tau_labels, device)
+
+        pred_native_df = pd.DataFrame(predictions_native, columns=output_features)
+
         pred_cart_df = convert_native_to_cartesian(
             coordinates, pred_native_df, onorm_cols, angular_cols, cartesian_cols,
             reco_t1_charged, reco_t1_pizero, reco_t2_charged, reco_t2_pizero,
@@ -731,12 +833,7 @@ def main():
         # === 3. phiCP ===
         print(">> Computing phiCP (true vs predicted)...")
         def get_phiCP(cart_df, E_t1, E_t2):
-            h1 = cart_df[[f'ts_hh_{t2}_x', f'ts_hh_{t2}_y', f'ts_hh_{t2}_z']].values
-            h2 = cart_df[[f'ts_hh_{t1}_x', f'ts_hh_{t1}_y', f'ts_hh_{t1}_z']].values
-            p_t1 = cart_df[[f'undecayed_{t1}_px', f'undecayed_{t1}_py', f'undecayed_{t1}_pz']].values
-            p_t2 = cart_df[[f'undecayed_{t2}_px', f'undecayed_{t2}_py', f'undecayed_{t2}_pz']].values
-            n2, n1 = tau_directions_com(p_t1, p_t2, E_t1, E_t2)
-            return compute_phiCP(h1, n1, h2, n2)
+            return phicp_from_cart(cart_df, E_t1, E_t2, tau_labels)
 
         true_E_t1 = df[f'undecayed_{t1}_e'].values
         true_E_t2 = df[f'undecayed_{t2}_e'].values
@@ -797,105 +894,10 @@ def main():
                 print(f">> WARNING: {lep_cols} not all found in test dataframe -- "
                       "skipping leptonic-leg (regressed-tau/Run3) polarimetric variables.")
 
-        # === 3a. phiCP uncertainty, from repeated flow sampling ===
-        # MAP gives a single point estimate; sampling the flow n_flow_samples times per
-        # event and taking the (circular) spread of the resulting phiCP gives a per-event
-        # error estimate on pred_phiCP.
-        n_fs = args.n_flow_samples
-        # each call below processes (events_in_chunk * n_fs) rows in one shot -- reusing
-        # MAP's own chunk_size here would mean e.g. 25000*50 = 1.25M rows per call (MAP
-        # itself never multiplies chunk_size by anything), which was empirically much
-        # slower than linear scaling predicted. Divide by n_fs so each call stays close
-        # to MAP's own per-call scale.
-        err_chunk_size = max(1, chunk_size // n_fs) if n_fs > 0 else chunk_size
-        pred_phiCP_err = np.full(len(df), np.nan)
-        n_sample_failures = 0
-        pending, chunk_ranges = [], []
-        # skipped either because we are only assembling cached results, or because the
-        # user turned the estimate off. It is a second expensive stage on top of MAP.
-        skip_err = args.from_cache or n_fs <= 0
-        if not skip_err:
-            print(f">> Estimating pred_phiCP uncertainty from {n_fs} flow samples/event "
-                  f"(chunk size {err_chunk_size} events, {err_chunk_size * n_fs} rows/call)...")
-        elif n_fs <= 0:
-            print(">> --n_flow_samples <= 0: skipping the pred_phiCP uncertainty estimate "
-                  "(pred_phiCP_err left as NaN)")
-        if args.from_cache:
-            # never recompute here: this stage draws n_flow_samples per event and
-            # is as expensive as MAP itself, which would defeat the point of a
-            # quick look. Use whatever is cached, leave the rest NaN.
-            got, _ = contiguous_cached_chunks(cache_dir, 'phicperr', n_events)
-            for cstart, cstop, cf in got:
-                pred_phiCP_err[cstart:cstop] = np.load(cf)
-            n_have = int(np.isfinite(pred_phiCP_err).sum())
-            print(f">> --from_cache: pred_phiCP_err filled for {n_have}/{len(df)} events "
-                  f"from cache, NaN elsewhere (not recomputed)")
-        # cached on the same chunk boundaries as the MAP stage above, for the same
-        # reason -- this draws n_flow_samples per event and is the second expensive
-        # stage, so an interrupted run should not have to redo it. Note the
-        # sampling itself runs at err_chunk_size (chunk_size // n_fs) internally;
-        # the CACHE unit is the coarser chunk_size, which keeps the file count
-        # sane without changing how the work is batched.
-        err_blocks = [] if skip_err else [(b, min(b + block, n_events))
-                                          for b in range(0, n_events, block)]
-        for bstart, bstop in err_blocks:
-            cache_f = os.path.join(cache_dir, f'phicperr_{bstart:09d}_{bstop:09d}.npy')
-            if args.resume and os.path.exists(cache_f):
-                pred_phiCP_err[bstart:bstop] = np.load(cache_f)
-            else:
-                pending.append((bstart, bstop, cache_f))
-        if err_blocks and len(pending) < len(err_blocks):
-            print(f">>   [resume] {len(err_blocks) - len(pending)}/{len(err_blocks)} phiCP-error "
-                  f"blocks loaded from cache")
-        # explicit (start, end) pairs clamped to the owning block -- deriving end
-        # from len(df) would let a block's last sub-chunk spill into the next
-        # block and recompute events already restored from its cache
-        if not skip_err:
-            chunk_ranges = [(st, min(st + err_chunk_size, bstop))
-                            for bstart, bstop, _ in pending
-                            for st in range(bstart, bstop, err_chunk_size)]
-        for start, end in tqdm(chunk_ranges, desc="Processing chunks (phiCP uncertainty)"):
-            C = end - start
-            # model.sample() occasionally hits a rare, non-reproducible numerical
-            # instability in nflows's rational-quadratic spline inverse (an assertion
-            # on a negative discriminant, from FP32 precision near bin-boundary
-            # derivatives for an unlucky random draw) -- not tied to any particular
-            # input event, confirmed by retrying the exact same chunk with fresh
-            # random noise. Retry a few times before giving up on the chunk.
-            samples_norm = None
-            for attempt in range(5):
-                try:
-                    with torch.no_grad():
-                        samples_norm = model.sample(num_samples=n_fs, context=X[start:end])  # [C, n_fs, F]
-                    break
-                except AssertionError:
-                    continue
-            if samples_norm is None:
-                n_sample_failures += 1
-                pred_phiCP_err[start:end] = np.nan
-                continue
-            samples_native = dataset.destandardize_outputs(samples_norm).cpu().numpy().reshape(C * n_fs, -1)
-            samples_native_df = pd.DataFrame(samples_native, columns=output_features)
-
-            rep = lambda arr: np.repeat(arr[start:end], n_fs, axis=0)
-            sample_cart_df = convert_native_to_cartesian(
-                coordinates, samples_native_df, onorm_cols, angular_cols, cartesian_cols,
-                rep(reco_t1_charged), rep(reco_t1_pizero), rep(reco_t2_charged), rep(reco_t2_pizero),
-            )
-            p_t1_s = sample_cart_df[[f'undecayed_{t1}_px', f'undecayed_{t1}_py', f'undecayed_{t1}_pz']].values
-            p_t2_s = sample_cart_df[[f'undecayed_{t2}_px', f'undecayed_{t2}_py', f'undecayed_{t2}_pz']].values
-            E_t1_s = np.sqrt(np.sum(p_t1_s ** 2, axis=1) + M_TAU ** 2)
-            E_t2_s = np.sqrt(np.sum(p_t2_s ** 2, axis=1) + M_TAU ** 2)
-            phiCP_samples = get_phiCP(sample_cart_df, E_t1_s, E_t2_s).reshape(C, n_fs)
-            pred_phiCP_err[start:end] = circular_std(phiCP_samples, axis=1)
-
-        for bstart, bstop, cache_f in pending:
-            np.save(cache_f, pred_phiCP_err[bstart:bstop])
-
-        if n_sample_failures > 0:
-            print(f"  WARNING: flow sampling failed on 5 retries for {n_sample_failures} chunk(s) "
-                  f"({n_sample_failures * err_chunk_size} events, upper bound); pred_phiCP_err set to NaN for those events.")
-
+        # === 3a. phiCP uncertainty ===
+        # Computed alongside MAP in _predict_over_chunks above rather than in a
+        # second pass over the sample, so both advance chunk by chunk and
+        # --from_cache sees complete rows for every finished chunk.
         # Reweight the (single, UnCorr) sample to CP-even/CP-odd hypotheses using
         # TauSpinner's own per-event weights, and compare true vs. predicted phiCP
         # under each hypothesis -- this tests whether the model's *predicted*
