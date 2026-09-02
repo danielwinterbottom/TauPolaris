@@ -249,9 +249,28 @@ def add_DM(df, tau_labels, dm_prefix='reco'):
     return dm[tau_labels[0]], dm[tau_labels[1]]
 
 
+def normalised_phicp_counts(phicp, weights, bin_edges):
+    """Per-bin phiCP counts normalised so they sum to 1, matching
+    plot_phiCP.py::plot_phicp_histogram.
+
+    That function normalises the WEIGHTS (w / w.sum()) and histograms with
+    density=False, so each bin holds the fraction of total weight it contains.
+    Using matplotlib's density=True instead would divide by the bin width and
+    inflate every downstream asymmetry by 1/binwidth (= 20/2pi = 3.183 for the
+    20 bins used here) -- which is exactly what this script used to do, making
+    its numbers incomparable with plot_phiCP.py's.
+    """
+    w = np.asarray(weights, dtype=float)
+    total = w.sum()
+    w = w / total if total != 0 else w
+    counts, _ = np.histogram(phicp, bins=bin_edges, weights=w)
+    return counts
+
+
 def asymmetry_quadrature(counts_a, counts_b):
-    """Same 'Asymmetry (quadrature)' metric as plot_phiCP.py: sqrt(sum((a-b)^2))
-    over the (density-normalized) per-bin counts of two phiCP histograms."""
+    """The 'Asymmetry' metric plot_phiCP.py reports: sqrt(sum((a-b)^2)) over two
+    phiCP histograms whose bins each sum to 1 (see normalised_phicp_counts).
+    Feed it probability-normalised counts, NOT densities."""
     return np.sqrt(np.sum((counts_a - counts_b) ** 2))
 
 
@@ -260,24 +279,30 @@ def plot_phiCP_cp_comparison(true_phiCP, pred_phiCP, w_cpeven, w_cpodd, title, o
     so it can be reused both for the full sample and per decay-mode combination."""
     fig, ax = plt.subplots(figsize=(7, 6))
     bins = np.linspace(0, 2 * np.pi, num_bins + 1)
-    true_even_counts, _, _ = ax.hist(true_phiCP, bins=bins, weights=w_cpeven, density=True, histtype='step',
-            linewidth=1.5, linestyle='--', color='steelblue', label='true, CP-even')
-    pred_even_counts, _, _ = ax.hist(pred_phiCP, bins=bins, weights=w_cpeven, density=True, histtype='step',
-            linewidth=1.5, color='steelblue', label='predicted, CP-even')
-    true_odd_counts, _, _ = ax.hist(true_phiCP, bins=bins, weights=w_cpodd, density=True, histtype='step',
-            linewidth=1.5, linestyle='--', color='tomato', label='true, CP-odd')
-    pred_odd_counts, _, _ = ax.hist(pred_phiCP, bins=bins, weights=w_cpodd, density=True, histtype='step',
-            linewidth=1.5, color='tomato', label='predicted, CP-odd')
+    # 1/N-style weight normalisation with density=False, exactly as
+    # plot_phiCP.py does -- so both the curves and the asymmetry printed on them
+    # are directly comparable between the two scripts.
+    series = (
+        ('true, CP-even',      true_phiCP, w_cpeven, 'steelblue', '--'),
+        ('predicted, CP-even', pred_phiCP, w_cpeven, 'steelblue', '-'),
+        ('true, CP-odd',       true_phiCP, w_cpodd,  'tomato',    '--'),
+        ('predicted, CP-odd',  pred_phiCP, w_cpodd,  'tomato',    '-'),
+    )
+    counts = {}
+    for label, vals, w, colour, style in series:
+        counts[label] = normalised_phicp_counts(vals, w, bins)
+        ax.stairs(counts[label], bins, color=colour, linestyle=style,
+                  linewidth=1.5, label=label)
 
-    true_asym = asymmetry_quadrature(true_even_counts, true_odd_counts)
-    pred_asym = asymmetry_quadrature(pred_even_counts, pred_odd_counts)
-    ax.text(0.05, 0.95, f'Asymmetry (quadrature), true: {true_asym:.4f}', transform=ax.transAxes,
+    true_asym = asymmetry_quadrature(counts['true, CP-even'], counts['true, CP-odd'])
+    pred_asym = asymmetry_quadrature(counts['predicted, CP-even'], counts['predicted, CP-odd'])
+    ax.text(0.05, 0.95, f'Asymmetry, true: {true_asym:.4f}', transform=ax.transAxes,
             verticalalignment='top', fontweight='bold', fontsize=9)
-    ax.text(0.05, 0.89, f'Asymmetry (quadrature), pred: {pred_asym:.4f}', transform=ax.transAxes,
+    ax.text(0.05, 0.89, f'Asymmetry, pred: {pred_asym:.4f}', transform=ax.transAxes,
             verticalalignment='top', fontweight='bold', fontsize=9)
 
     ax.set_xlabel(r'$\phi_{CP}$ [rad]')
-    ax.set_ylabel('a.u.')
+    ax.set_ylabel('Normalized counts')
     ax.set_title(title)
     ax.legend(fontsize=9)
     fig.tight_layout()
@@ -711,10 +736,13 @@ def main():
             else:
                 fig, ax = plt.subplots(figsize=(6, 5))
                 bins = np.linspace(0, 2 * np.pi, PHICP_BINS + 1)
-                ax.hist(true_phiCP, bins=bins, density=True, histtype='step', linewidth=1.5, label='true')
-                ax.hist(pred_phiCP_variant, bins=bins, density=True, histtype='step', linewidth=1.5, label='predicted')
+                ones = np.ones(len(true_phiCP))
+                ax.stairs(normalised_phicp_counts(true_phiCP, ones, bins), bins,
+                          linewidth=1.5, label='true')
+                ax.stairs(normalised_phicp_counts(pred_phiCP_variant, ones, bins), bins,
+                          linewidth=1.5, label='predicted')
                 ax.set_xlabel(r'$\phi_{CP}$ [rad]')
-                ax.set_ylabel('a.u.')
+                ax.set_ylabel('Normalized counts')
                 ax.legend()
                 fig.tight_layout()
                 fig.savefig(os.path.join(outdir, f'{filename_stem}.pdf'), dpi=130)

@@ -248,8 +248,10 @@ def cos_between(a, b):
 
 def asymmetry_quadrature(counts_a, counts_b):
     """Same metric as plot_phiCP.py / evaluate_polvec.py: sqrt(sum((a-b)^2)) over
-    density-normalised per-bin counts. Kept so numbers here line up with the
-    existing plots."""
+    per-bin counts that each sum to 1. Note PROBABILITY-normalised, not density:
+    plot_phiCP.py normalises the weights (w / w.sum()) and histograms with
+    density=False, so dividing by the bin width here would inflate the result by
+    1/binwidth = 20/2pi = 3.183 and break comparability with its plots."""
     return float(np.sqrt(np.sum((counts_a - counts_b) ** 2)))
 
 
@@ -263,14 +265,20 @@ def cp_separation(phicp, w_even, w_odd, bins=PHICP_BINS):
     separation between the two hypotheses -- useful because the quadrature sum
     changes if anyone edits PHICP_BINS."""
     edges = np.linspace(0, 2 * np.pi, bins + 1)
-    ce, _ = np.histogram(phicp, bins=edges, weights=w_even)
-    co, _ = np.histogram(phicp, bins=edges, weights=w_odd)
-    pe = ce / max(ce.sum(), 1e-12)
-    po = co / max(co.sum(), 1e-12)
-    dens_e = pe / (edges[1] - edges[0])
-    dens_o = po / (edges[1] - edges[0])
+    # Normalise the WEIGHTS before histogramming, not the counts after -- that is
+    # what plot_phiCP.py::plot_phicp_histogram does, and the two differ whenever
+    # any event's phiCP is NaN or outside [0, 2pi]: such events contribute to the
+    # weight sum but to no bin, so normalising afterwards silently rescales.
+    def _probs(w):
+        w = np.asarray(w, dtype=float)
+        total = w.sum()
+        if total != 0:
+            w = w / total
+        return np.histogram(phicp, bins=edges, weights=w)[0]
+
+    pe, po = _probs(w_even), _probs(w_odd)
     denom = np.maximum((pe + po) / 2.0, 1e-12)
-    return asymmetry_quadrature(dens_e, dens_o), float(np.sqrt(np.sum((pe - po) ** 2 / denom)))
+    return asymmetry_quadrature(pe, po), float(np.sqrt(np.sum((pe - po) ** 2 / denom)))
 
 
 def metrics_for_mask(obs, truth, mask, w_even, w_odd):
