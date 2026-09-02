@@ -424,7 +424,11 @@ def main():
                                 'stopped. Caches live in <outdir>/_cache and are keyed by event '
                                 'range, so this is safe to pass always.')
     argparser.add_argument('--n_flow_samples', type=int, default=50,
-                            help='number of flow samples per event used to estimate an error on pred_phiCP (circular std)')
+                            help='number of flow samples per event used to estimate an error on '
+                                 'pred_phiCP (circular std). <= 0 skips the estimate entirely and '
+                                 'leaves pred_phiCP_err as NaN -- this is a second expensive stage '
+                                 'on top of the MAP prediction, so it is worth turning off when the '
+                                 'per-event error is not needed.')
     args = argparser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -803,11 +807,19 @@ def main():
         # itself never multiplies chunk_size by anything), which was empirically much
         # slower than linear scaling predicted. Divide by n_fs so each call stays close
         # to MAP's own per-call scale.
-        err_chunk_size = max(1, chunk_size // n_fs)
-        print(f">> Estimating pred_phiCP uncertainty from {n_fs} flow samples/event "
-              f"(chunk size {err_chunk_size} events, {err_chunk_size * n_fs} rows/call)...")
+        err_chunk_size = max(1, chunk_size // n_fs) if n_fs > 0 else chunk_size
         pred_phiCP_err = np.full(len(df), np.nan)
         n_sample_failures = 0
+        pending, chunk_ranges = [], []
+        # skipped either because we are only assembling cached results, or because the
+        # user turned the estimate off. It is a second expensive stage on top of MAP.
+        skip_err = args.from_cache or n_fs <= 0
+        if not skip_err:
+            print(f">> Estimating pred_phiCP uncertainty from {n_fs} flow samples/event "
+                  f"(chunk size {err_chunk_size} events, {err_chunk_size * n_fs} rows/call)...")
+        elif n_fs <= 0:
+            print(">> --n_flow_samples <= 0: skipping the pred_phiCP uncertainty estimate "
+                  "(pred_phiCP_err left as NaN)")
         if args.from_cache:
             # never recompute here: this stage draws n_flow_samples per event and
             # is as expensive as MAP itself, which would defeat the point of a
@@ -818,17 +830,14 @@ def main():
             n_have = int(np.isfinite(pred_phiCP_err).sum())
             print(f">> --from_cache: pred_phiCP_err filled for {n_have}/{len(df)} events "
                   f"from cache, NaN elsewhere (not recomputed)")
-            pending, chunk_ranges = [], []
         # cached on the same chunk boundaries as the MAP stage above, for the same
         # reason -- this draws n_flow_samples per event and is the second expensive
         # stage, so an interrupted run should not have to redo it. Note the
         # sampling itself runs at err_chunk_size (chunk_size // n_fs) internally;
         # the CACHE unit is the coarser chunk_size, which keeps the file count
         # sane without changing how the work is batched.
-        err_blocks = [] if args.from_cache else [(b, min(b + block, n_events))
-                                                 for b in range(0, n_events, block)]
-        if not args.from_cache:
-            pending = []
+        err_blocks = [] if skip_err else [(b, min(b + block, n_events))
+                                          for b in range(0, n_events, block)]
         for bstart, bstop in err_blocks:
             cache_f = os.path.join(cache_dir, f'phicperr_{bstart:09d}_{bstop:09d}.npy')
             if args.resume and os.path.exists(cache_f):
@@ -841,7 +850,7 @@ def main():
         # explicit (start, end) pairs clamped to the owning block -- deriving end
         # from len(df) would let a block's last sub-chunk spill into the next
         # block and recompute events already restored from its cache
-        if not args.from_cache:
+        if not skip_err:
             chunk_ranges = [(st, min(st + err_chunk_size, bstop))
                             for bstart, bstop, _ in pending
                             for st in range(bstart, bstop, err_chunk_size)]
