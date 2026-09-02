@@ -28,6 +28,7 @@ Run (from the DiTauEntanglement directory):
     python3 taupolaris/scripts/evaluate_polvec.py --config config_polvec.yaml --max_events 2000
 """
 import argparse
+import glob
 import os
 import numpy as np
 import pandas as pd
@@ -99,6 +100,61 @@ def hh_native_prefix(output_features, tau_label):
             if col.startswith('ts_hh') and col.endswith(suffix):
                 return col[:-len(suffix)]
     raise ValueError(f"No ts_hh_* output feature found for tau '{tau_label}' in {output_features}")
+
+
+def _map_over_chunks(model, X, dataset, nn_config, args, cache_dir, n_events, block, chunk_size):
+    """MAP prediction, one cached chunk at a time.
+
+    MAP over a few million events takes many hours, and if the process is killed
+    part-way (OOM, a node watchdog) all of it is otherwise lost. Each chunk is
+    written to cache_dir as it finishes, so --resume picks up where the previous
+    run stopped and --from_cache can build outputs from whatever completed. The
+    checkpoint unit is the existing chunk_size rather than a separate knob -- it
+    is already the unit flow_map_predict works in, so one cached file is exactly
+    one unit of its work.
+    """
+    parts, n_cached = [], 0
+    for bstart in tqdm(range(0, n_events, block), desc="Processing chunks (MAP)"):
+        bstop = min(bstart + block, n_events)
+        cache_f = os.path.join(cache_dir, f'map_{bstart:09d}_{bstop:09d}.npy')
+        if args.resume and os.path.exists(cache_f):
+            parts.append(np.load(cache_f))
+            n_cached += 1
+            continue
+        _, part = flow_map_predict(
+            model, X[bstart:bstop], test_dataset=dataset,
+            method=nn_config.get('map_method', 'gradient'),
+            num_draws=nn_config.get('map_num_draws', 100),
+            chunk_size=chunk_size,
+        )
+        np.save(cache_f, part)
+        parts.append(part)
+    if n_cached:
+        print(f">>   [resume] {n_cached}/{len(parts)} MAP chunks loaded from cache")
+    return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+
+
+def contiguous_cached_chunks(cache_dir, kind, n_events):
+    """The cached chunk files covering events 0..N contiguously, and that N.
+
+    Chunks are named <kind>_<start>_<stop>.npy. A gap means the run that wrote
+    them was interrupted mid-way or had chunks removed, and anything past the gap
+    cannot be used without leaving a hole in the middle of the event set -- so we
+    stop at the first one.
+    """
+    found = {}
+    for f in glob.glob(os.path.join(cache_dir, f'{kind}_*.npy')):
+        try:
+            start, stop = (int(x) for x in os.path.basename(f)[:-4].split('_')[-2:])
+        except ValueError:
+            continue
+        found[start] = (stop, f)
+    files, at = [], 0
+    while at < n_events and at in found:
+        stop, f = found[at]
+        files.append((at, stop, f))
+        at = stop
+    return files, at
 
 
 def columns_needed(data_config, tau_labels, coordinates, leptonic_mode, available):
@@ -354,6 +410,14 @@ def main():
     argparser.add_argument('--num_bins', type=int, default=50)
     argparser.add_argument('--oneprong', action='store_true', help='whether to only evaluate on 1-prong taus only')
     argparser.add_argument('--threeprong', action='store_true', help='whether to only evaluate on events with at least 1 3-prong tau')
+    argparser.add_argument('--from_cache', action='store_true',
+                           help='skip the MAP prediction entirely and build the outputs from the '
+                                'chunks already cached in <outdir>/_cache, truncating to however '
+                                'many events are complete. Lets a long-running evaluation be '
+                                'inspected from a second shell without disturbing it, and salvages '
+                                'a run that died part-way. pred_phiCP_err is filled only where its '
+                                'own cache exists (NaN elsewhere) -- it is never recomputed here, '
+                                'since that stage is as expensive as MAP itself.')
     argparser.add_argument('--resume', action='store_true',
                            help='reuse cached per-chunk results from a previous run instead of '
                                 'recomputing them, so an interrupted evaluation picks up where it '
@@ -457,8 +521,6 @@ def main():
 
         # --- MAP prediction, in the model's native (training) coordinate space ---
         X, _ = dataset[:]
-        X = X.to(device)
-        print(f">> Running MAP prediction (method={nn_config.get('map_method', 'gradient')})...")
         chunk_size = nn_config.get('chunk_size', 25000)
 
         # Cached per chunk. MAP over a few million events takes many hours, and if
@@ -472,27 +534,24 @@ def main():
         os.makedirs(cache_dir, exist_ok=True)
         n_events = len(df)
         block = chunk_size
-        parts = []
-        n_cached = 0
-        for bstart in tqdm(range(0, n_events, block), desc="Processing chunks (MAP)"):
-            bstop = min(bstart + block, n_events)
-            cache_f = os.path.join(cache_dir, f'map_{bstart:09d}_{bstop:09d}.npy')
-            if args.resume and os.path.exists(cache_f):
-                parts.append(np.load(cache_f))
-                n_cached += 1
+
+        if args.from_cache:
+            cached, n_avail = contiguous_cached_chunks(cache_dir, 'map', n_events)
+            if not cached:
+                print(f">> --from_cache: nothing cached in {cache_dir}, skipping {test_output_name}")
                 continue
-            _, part = flow_map_predict(
-                model, X[bstart:bstop], test_dataset=dataset,
-                method=nn_config.get('map_method', 'gradient'),
-                num_draws=nn_config.get('map_num_draws', 100),
-                chunk_size=chunk_size
-            )
-            np.save(cache_f, part)
-            parts.append(part)
-        if n_cached:
-            print(f">>   [resume] {n_cached}/{len(parts)} MAP chunks loaded from cache")
-        predictions_native = np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
-        del parts
+            print(f">> --from_cache: {len(cached)} MAP chunks cover {n_avail}/{n_events} events "
+                  f"({100 * n_avail / n_events:.1f}%); building outputs from those")
+            predictions_native = np.concatenate([np.load(f) for _, _, f in cached], axis=0)
+            df = df.iloc[:n_avail].reset_index(drop=True)
+            n_events = n_avail
+        else:
+            X, _ = dataset[:]
+            X = X.to(device)
+            print(f">> Running MAP prediction (method={nn_config.get('map_method', 'gradient')})...")
+            predictions_native = _map_over_chunks(
+                model, X, dataset, nn_config, args, cache_dir, n_events, block, chunk_size)
+
         pred_native_df = pd.DataFrame(predictions_native, columns=output_features)
 
         cartesian_cols = cartesian_output_order(tau_labels)
@@ -747,31 +806,45 @@ def main():
         err_chunk_size = max(1, chunk_size // n_fs)
         print(f">> Estimating pred_phiCP uncertainty from {n_fs} flow samples/event "
               f"(chunk size {err_chunk_size} events, {err_chunk_size * n_fs} rows/call)...")
-        pred_phiCP_err = np.empty(len(df))
+        pred_phiCP_err = np.full(len(df), np.nan)
         n_sample_failures = 0
+        if args.from_cache:
+            # never recompute here: this stage draws n_flow_samples per event and
+            # is as expensive as MAP itself, which would defeat the point of a
+            # quick look. Use whatever is cached, leave the rest NaN.
+            got, _ = contiguous_cached_chunks(cache_dir, 'phicperr', n_events)
+            for cstart, cstop, cf in got:
+                pred_phiCP_err[cstart:cstop] = np.load(cf)
+            n_have = int(np.isfinite(pred_phiCP_err).sum())
+            print(f">> --from_cache: pred_phiCP_err filled for {n_have}/{len(df)} events "
+                  f"from cache, NaN elsewhere (not recomputed)")
+            pending, chunk_ranges = [], []
         # cached on the same chunk boundaries as the MAP stage above, for the same
         # reason -- this draws n_flow_samples per event and is the second expensive
         # stage, so an interrupted run should not have to redo it. Note the
         # sampling itself runs at err_chunk_size (chunk_size // n_fs) internally;
         # the CACHE unit is the coarser chunk_size, which keeps the file count
         # sane without changing how the work is batched.
-        err_blocks = [(b, min(b + block, n_events)) for b in range(0, n_events, block)]
-        pending = []
+        err_blocks = [] if args.from_cache else [(b, min(b + block, n_events))
+                                                 for b in range(0, n_events, block)]
+        if not args.from_cache:
+            pending = []
         for bstart, bstop in err_blocks:
             cache_f = os.path.join(cache_dir, f'phicperr_{bstart:09d}_{bstop:09d}.npy')
             if args.resume and os.path.exists(cache_f):
                 pred_phiCP_err[bstart:bstop] = np.load(cache_f)
             else:
                 pending.append((bstart, bstop, cache_f))
-        if len(pending) < len(err_blocks):
+        if err_blocks and len(pending) < len(err_blocks):
             print(f">>   [resume] {len(err_blocks) - len(pending)}/{len(err_blocks)} phiCP-error "
                   f"blocks loaded from cache")
         # explicit (start, end) pairs clamped to the owning block -- deriving end
         # from len(df) would let a block's last sub-chunk spill into the next
         # block and recompute events already restored from its cache
-        chunk_ranges = [(st, min(st + err_chunk_size, bstop))
-                        for bstart, bstop, _ in pending
-                        for st in range(bstart, bstop, err_chunk_size)]
+        if not args.from_cache:
+            chunk_ranges = [(st, min(st + err_chunk_size, bstop))
+                            for bstart, bstop, _ in pending
+                            for st in range(bstart, bstop, err_chunk_size)]
         for start, end in tqdm(chunk_ranges, desc="Processing chunks (phiCP uncertainty)"):
             C = end - start
             # model.sample() occasionally hits a rare, non-reproducible numerical
