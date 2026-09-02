@@ -314,7 +314,10 @@ def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument('--config', '-c', required=True, help='path to the configuration file')
     argparser.add_argument('--useCPU', action='store_true', help='force CPU evaluation')
-    argparser.add_argument('--max_events', type=int, default=5000, help='number of test events to evaluate on')
+    argparser.add_argument('--max_events', type=int, default=5000,
+                           help='number of test events to evaluate on; <= 0 means all of them. '
+                                'NOTE this used to be a plain df.iloc[:max_events], so -1 silently '
+                                'dropped the last event rather than keeping everything.')
     argparser.add_argument('--num_bins', type=int, default=50)
     argparser.add_argument('--oneprong', action='store_true', help='whether to only evaluate on 1-prong taus only')
     argparser.add_argument('--threeprong', action='store_true', help='whether to only evaluate on events with at least 1 3-prong tau')
@@ -391,7 +394,10 @@ def main():
         data_config['test_dataset'] = test_dataset_path
         dataset, df, _, _ = get_test_dataset(data_config, norm_data, oneprong=args.oneprong, threeprong=args.threeprong)
 
-        if args.max_events is not None and len(df) > args.max_events:
+        # max_events <= 0 means "all". Guarding on > 0 matters: the old condition
+        # let -1 through to df.iloc[:-1], which silently evaluated on every event
+        # except the last one instead of on the whole sample.
+        if args.max_events is not None and args.max_events > 0 and len(df) > args.max_events:
             df = df.iloc[:args.max_events].reset_index(drop=True)
             dataset = RegressionDataset(
                 df, input_features, output_features,
