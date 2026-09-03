@@ -817,9 +817,23 @@ def _prepare_train_val_test_split(k, config, train_df_path, val_df_path, test_df
         test_df_ = df.iloc[train_size + val_size:train_size + val_size + test_size]
     del df
 
-    val_df_.to_parquet(val_df_path)
-    test_df_.to_parquet(test_df_path)
-    train_df_.to_parquet(train_df_path)
+    def _write_atomic(frame, path):
+        # Write to a process-unique temp file and rename into place, so a job
+        # killed mid-write (eviction, OOM) leaves the previous file intact
+        # rather than a truncated one with no parquet footer. The rename is
+        # atomic within a directory.
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            frame.to_parquet(tmp)
+            os.replace(tmp, path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+
+    _write_atomic(val_df_, val_df_path)
+    _write_atomic(test_df_, test_df_path)
+    _write_atomic(train_df_, train_df_path)
     print(f">> Train, validation and test dataframes for {k} saved.")
     print(f">> Train dataframe size: {len(train_df_)}, Validation dataframe size: {len(val_df_)}, Test dataframe size: {len(test_df_)}")
 
@@ -872,8 +886,16 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
 
 
     extra_name = ''
+    # The coordinate system MUST appear in the name. onorm and onorm_angular
+    # have different column sets (angular is a superset), and without this two
+    # jobs differing only in coordinates share the same split files -- they then
+    # overwrite each other's, and a job reading one while the other rewrites it
+    # sees a truncated footer. 'cartesian' is kept for standard so existing
+    # --loadDS files stay valid.
     if config['coordinates'] == 'standard':
         extra_name += 'cartesian'
+    else:
+        extra_name += str(config['coordinates'])
     if leptonic_mode>=0:
         extra_name += f"_leptonic_mode_{leptonic_mode}"
     if inc_three_prongs:
