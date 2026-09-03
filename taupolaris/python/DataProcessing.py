@@ -14,14 +14,17 @@ class RegressionDataset(Dataset):
                  input_mean=None, input_std=None,
                  output_mean=None, output_std=None,
                  normalize_inputs=True, normalize_outputs=False, eps=1e-8,
-                 weights=None):
+                 weights=None, X=None, y=None):
         """
         A regression dataset that can standardize features using provided means/stds.
 
         Parameters
         ----------
-        dataframe : pd.DataFrame
-            Input data.
+        dataframe : pd.DataFrame or None
+            Input data. May be None when X and y are supplied directly, which lets
+            a caller stream several files into one preallocated pair of tensors
+            instead of first building a single concatenated dataframe -- see
+            get_train_val_test_datasets.
         input_features : list[str]
             Names of input columns.
         output_features : list[str]
@@ -50,8 +53,9 @@ class RegressionDataset(Dataset):
         # full-size arrays alive at once (frame, intermediate, tensor) for data
         # that is float32 in the end anyway. to_numpy(dtype=float32) makes the
         # one array we need and from_numpy wraps it without copying again.
-        X = torch.from_numpy(dataframe[input_features].to_numpy(dtype=np.float32))
-        y = torch.from_numpy(dataframe[output_features].to_numpy(dtype=np.float32))
+        if X is None or y is None:
+            X = torch.from_numpy(dataframe[input_features].to_numpy(dtype=np.float32))
+            y = torch.from_numpy(dataframe[output_features].to_numpy(dtype=np.float32))
 
         no_standardize_features = ['reco_taup_haspizero', 'reco_taun_haspizero', 'reco_taup_is3prong', 'reco_taun_is3prong', 'reco_tau2_haspizero', 'reco_tau2_is3prong']
         input_skip_mask = torch.tensor(
@@ -845,8 +849,7 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
     if training_weight_columns:
         keep_columns = keep_columns + [c for c in training_weight_columns if c not in keep_columns]
 
-    train_parts = []
-    val_parts = []
+    split_paths = []
 
 
     extra_name = ''
@@ -885,66 +888,68 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
             if proc.exitcode != 0:
                 raise RuntimeError(f"Preparing train/val/test split for dataset '{k}' failed (subprocess exit code {proc.exitcode}).")
 
-        # only load the columns we actually need, so we never pay the memory
-        # cost of reading the full dataframe from disk
-        # float32 throughout: everything in keep_columns is numeric and ends up in
-        # a float32 tensor regardless, so carrying float64 here just doubles the
-        # dataframe, the concat below, and the shuffle copy for no benefit.
-        train_df_ = pd.read_parquet(train_df_path, columns=keep_columns).astype(np.float32)
-        val_df_ = pd.read_parquet(val_df_path, columns=keep_columns).astype(np.float32)
-        # test_df_ is never used again after being saved to disk above, so it's
-        # not read back here.
+        split_paths.append((k, train_df_path, val_df_path))
 
-        print(f">> Size of train dataframe: {train_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
-        print(f">> Size of val dataframe: {val_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
+    # Fill preallocated tensors one file at a time instead of building a single
+    # concatenated dataframe first. The old path held, at its peak, every
+    # per-dataset frame plus the concatenated copy plus the numpy array plus the
+    # torch tensor -- four full-size copies of the training set, which is what
+    # pushed an 87 GB cgroup limit over. Here only one file's frame is alive at a
+    # time on top of the final tensors.
+    def _stream(paths, label):
+        n_total = sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
+        X = torch.empty((n_total, len(input_features)), dtype=torch.float32)
+        y = torch.empty((n_total, len(output_features)), dtype=torch.float32)
+        w = torch.empty(n_total, dtype=torch.float32) if training_weight_columns else None
+        off = 0
+        for path in paths:
+            part = pd.read_parquet(path, columns=keep_columns)
+            n = len(part)
+            # to_numpy(dtype=float32) converts once, straight into the slice --
+            # .values would promote to float64 first if any column is double
+            X[off:off + n] = torch.from_numpy(part[input_features].to_numpy(dtype=np.float32))
+            y[off:off + n] = torch.from_numpy(part[output_features].to_numpy(dtype=np.float32))
+            if w is not None:
+                w[off:off + n] = torch.from_numpy(
+                    part[training_weight_columns].sum(axis=1).to_numpy(dtype=np.float32))
+            off += n
+            del part
+        print(f">> {label}: {n_total} events, X {X.element_size() * X.nelement() / 1e9:.2f} GB "
+              f"+ y {y.element_size() * y.nelement() / 1e9:.2f} GB")
+        return X, y, w
 
-        train_parts.append(train_df_)
-        val_parts.append(val_df_)
-
-    # one concat of everything, not a running one per dataset: the incremental
-    # version rewrote the whole accumulated frame on each pass, so total copying
-    # grew quadratically in the number of datasets.
-    train_df = train_parts[0] if len(train_parts) == 1 else pd.concat(train_parts, ignore_index=True)
-    val_df = val_parts[0] if len(val_parts) == 1 else pd.concat(val_parts, ignore_index=True)
-    del train_parts, val_parts
+    train_X, train_y, train_weights = _stream([p for _, p, _ in split_paths], "train")
+    val_X, val_y, val_weights = _stream([p for _, _, p in split_paths], "val")
 
     if shuffle:
-        # Deliberately NOT df.sample(frac=1) any more. That allocated a full extra
-        # copy of an already multi-GB frame, and it is redundant: training goes
-        # through DataLoader(shuffle=True) in setup_model_and_training, which
-        # reorders every epoch, and validation loss is a mean over the whole set
-        # so its order does not matter either. Row order here only affects how the
-        # datasets sit end-to-end before the DataLoader shuffles them.
-        print(">> Skipping the dataframe shuffle (DataLoader shuffles each epoch); "
-              "row order is dataset-by-dataset as concatenated.")
+        # Deliberately NOT df.sample(frac=1). That allocated a full extra copy of
+        # an already multi-GB frame, and it is redundant: training goes through
+        # DataLoader(shuffle=True) in setup_model_and_training, which reorders
+        # every epoch, and validation loss is a mean over the whole set so its
+        # order does not matter either.
+        print(">> Skipping the row shuffle (DataLoader shuffles each epoch); "
+              "row order is dataset-by-dataset as loaded.")
 
-    print(f"Number of events in training dataframe: {len(train_df)}, validation dataframe: {len(val_df)}")
-    print('Columns in training dataframe:', train_df.columns.tolist())
-    print('>> Number of input features:', len(input_features))
+    print(f">> Number of input features: {len(input_features)}")
     print('Input features:', input_features)
-    print('>> Number of output features:', len(output_features))
+    print(f">> Number of output features: {len(output_features)}")
     print('Output features:', output_features)
-
-    # optional per-event training weight = sum of the configured TauSpinner weight columns
     if training_weight_columns:
-        train_weights = torch.tensor(train_df[training_weight_columns].sum(axis=1).values, dtype=torch.float32)
-        val_weights = torch.tensor(val_df[training_weight_columns].sum(axis=1).values, dtype=torch.float32)
         print(f">> Using training weight = sum of columns {training_weight_columns} "
               f"(train mean={train_weights.mean().item():.4f}, val mean={val_weights.mean().item():.4f})")
-    else:
-        train_weights = None
-        val_weights = None
 
-    # define datasets and normalize inputs and outputs
-    train_dataset = RegressionDataset(train_df, input_features, output_features, normalize_inputs=True, normalize_outputs=True,
-                                       weights=train_weights)
-    del train_df
+    train_dataset = RegressionDataset(None, input_features, output_features,
+                                      normalize_inputs=True, normalize_outputs=True,
+                                      weights=train_weights, X=train_X, y=train_y)
+    del train_X, train_y
     in_mean, in_std = train_dataset.input_mean, train_dataset.input_std
     out_mean, out_std = train_dataset.output_mean, train_dataset.output_std
-    val_dataset = RegressionDataset(val_df, input_features, output_features, normalize_inputs=True, normalize_outputs=True,
-                                      input_mean=in_mean, input_std=in_std, output_mean=out_mean, output_std=out_std,
-                                      weights=val_weights)
-    del val_df
+    val_dataset = RegressionDataset(None, input_features, output_features,
+                                    normalize_inputs=True, normalize_outputs=True,
+                                    input_mean=in_mean, input_std=in_std,
+                                    output_mean=out_mean, output_std=out_std,
+                                    weights=val_weights, X=val_X, y=val_y)
+    del val_X, val_y
 
     return train_dataset, val_dataset, input_features, output_features
 
