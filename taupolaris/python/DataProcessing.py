@@ -824,6 +824,25 @@ def _prepare_train_val_test_split(k, config, train_df_path, val_df_path, test_df
     print(f">> Train dataframe size: {len(train_df_)}, Validation dataframe size: {len(val_df_)}, Test dataframe size: {len(test_df_)}")
 
 
+def _rows(path):
+    """Row count from the parquet footer, naming the file if it cannot be read.
+
+    A split file left truncated by an interrupted run (the writer is killed
+    part-way, so the footer never lands) otherwise surfaces as a bare
+    "Parquet magic bytes not found in footer" with no indication of which of
+    the dozen files is at fault.
+    """
+    try:
+        return pq.ParquetFile(path).metadata.num_rows
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not read '{path}'. It is most likely truncated -- a run that was "
+            f"killed while writing it leaves the footer missing. Delete it (and any "
+            f"sibling train_/val_/test_dataframe_*.parquet in that directory) and rerun; "
+            f"they are regenerated automatically unless --loadDS is passed. "
+            f"Underlying error: {type(e).__name__}: {e}") from e
+
+
 def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False):
 
     leptonic_mode = config.get('leptonic_mode', -1)  # default to -1 if not specified i.e no selection based on whether tau is leptonic is applied
@@ -887,6 +906,11 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
             proc.join()
             if proc.exitcode != 0:
                 raise RuntimeError(f"Preparing train/val/test split for dataset '{k}' failed (subprocess exit code {proc.exitcode}).")
+            # confirm the three files actually landed. The subprocess can exit 0
+            # and still leave a short file if the filesystem ran out of room, and
+            # that only shows up much later as an unreadable footer.
+            for written in (train_df_path, val_df_path, test_df_path):
+                _rows(written)
 
         split_paths.append((k, train_df_path, val_df_path))
 
@@ -897,7 +921,7 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
     # pushed an 87 GB cgroup limit over. Here only one file's frame is alive at a
     # time on top of the final tensors.
     def _stream(paths, label):
-        n_total = sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
+        n_total = sum(_rows(p) for p in paths)
         X = torch.empty((n_total, len(input_features)), dtype=torch.float32)
         y = torch.empty((n_total, len(output_features)), dtype=torch.float32)
         w = torch.empty(n_total, dtype=torch.float32) if training_weight_columns else None
