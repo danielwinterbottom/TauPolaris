@@ -44,8 +44,14 @@ class RegressionDataset(Dataset):
             Names of columns (from input_features and/or output_features) to
             leave untouched, e.g. boolean flags that shouldn't be standardized.
         """
-        X = torch.tensor(dataframe[input_features].values, dtype=torch.float32)
-        y = torch.tensor(dataframe[output_features].values, dtype=torch.float32)
+        # .values on a frame with any float64 column promotes EVERYTHING to
+        # float64, so `torch.tensor(df[cols].values, dtype=float32)` built a full
+        # 8-byte intermediate and then copied it down to 4 bytes -- three
+        # full-size arrays alive at once (frame, intermediate, tensor) for data
+        # that is float32 in the end anyway. to_numpy(dtype=float32) makes the
+        # one array we need and from_numpy wraps it without copying again.
+        X = torch.from_numpy(dataframe[input_features].to_numpy(dtype=np.float32))
+        y = torch.from_numpy(dataframe[output_features].to_numpy(dtype=np.float32))
 
         no_standardize_features = ['reco_taup_haspizero', 'reco_taun_haspizero', 'reco_taup_is3prong', 'reco_taun_is3prong', 'reco_tau2_haspizero', 'reco_tau2_is3prong']
         input_skip_mask = torch.tensor(
@@ -136,8 +142,14 @@ class MorphDataset(Dataset):
         eps : float
             Small value to prevent division by zero.
         """
-        X = torch.tensor(dataframe[input_features].values, dtype=torch.float32)
-        y = torch.tensor(dataframe[output_features].values, dtype=torch.float32)
+        # .values on a frame with any float64 column promotes EVERYTHING to
+        # float64, so `torch.tensor(df[cols].values, dtype=float32)` built a full
+        # 8-byte intermediate and then copied it down to 4 bytes -- three
+        # full-size arrays alive at once (frame, intermediate, tensor) for data
+        # that is float32 in the end anyway. to_numpy(dtype=float32) makes the
+        # one array we need and from_numpy wraps it without copying again.
+        X = torch.from_numpy(dataframe[input_features].to_numpy(dtype=np.float32))
+        y = torch.from_numpy(dataframe[output_features].to_numpy(dtype=np.float32))
         c = torch.tensor(dataframe[context_features].values, dtype=torch.float32)
 
         self.normalize_inputs = normalize_inputs
@@ -833,8 +845,8 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
     if training_weight_columns:
         keep_columns = keep_columns + [c for c in training_weight_columns if c not in keep_columns]
 
-    train_df = None
-    val_df = None
+    train_parts = []
+    val_parts = []
 
 
     extra_name = ''
@@ -875,26 +887,36 @@ def get_train_val_test_datasets(keys, config, shuffle=True, load_existing=False)
 
         # only load the columns we actually need, so we never pay the memory
         # cost of reading the full dataframe from disk
-        train_df_ = pd.read_parquet(train_df_path, columns=keep_columns)
-        val_df_ = pd.read_parquet(val_df_path, columns=keep_columns)
+        # float32 throughout: everything in keep_columns is numeric and ends up in
+        # a float32 tensor regardless, so carrying float64 here just doubles the
+        # dataframe, the concat below, and the shuffle copy for no benefit.
+        train_df_ = pd.read_parquet(train_df_path, columns=keep_columns).astype(np.float32)
+        val_df_ = pd.read_parquet(val_df_path, columns=keep_columns).astype(np.float32)
         # test_df_ is never used again after being saved to disk above, so it's
         # not read back here.
 
         print(f">> Size of train dataframe: {train_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
         print(f">> Size of val dataframe: {val_df_.memory_usage(deep=True).sum() / 1e9:.2f} GB")
 
-        if train_df is None:
-            train_df = train_df_
-        else:
-            train_df = pd.concat([train_df, train_df_], ignore_index=True)
-        if val_df is None:
-            val_df = val_df_
-        else:
-            val_df = pd.concat([val_df, val_df_], ignore_index=True)
+        train_parts.append(train_df_)
+        val_parts.append(val_df_)
+
+    # one concat of everything, not a running one per dataset: the incremental
+    # version rewrote the whole accumulated frame on each pass, so total copying
+    # grew quadratically in the number of datasets.
+    train_df = train_parts[0] if len(train_parts) == 1 else pd.concat(train_parts, ignore_index=True)
+    val_df = val_parts[0] if len(val_parts) == 1 else pd.concat(val_parts, ignore_index=True)
+    del train_parts, val_parts
 
     if shuffle:
-        train_df = train_df.sample(frac=1, random_state=42).reset_index(drop=True)
-        val_df = val_df.sample(frac=1, random_state=42).reset_index(drop=True)
+        # Deliberately NOT df.sample(frac=1) any more. That allocated a full extra
+        # copy of an already multi-GB frame, and it is redundant: training goes
+        # through DataLoader(shuffle=True) in setup_model_and_training, which
+        # reorders every epoch, and validation loss is a mean over the whole set
+        # so its order does not matter either. Row order here only affects how the
+        # datasets sit end-to-end before the DataLoader shuffles them.
+        print(">> Skipping the dataframe shuffle (DataLoader shuffles each epoch); "
+              "row order is dataset-by-dataset as concatenated.")
 
     print(f"Number of events in training dataframe: {len(train_df)}, validation dataframe: {len(val_df)}")
     print('Columns in training dataframe:', train_df.columns.tolist())

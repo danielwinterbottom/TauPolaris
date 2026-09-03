@@ -7,6 +7,8 @@ def create_job(
     use_gpu: bool = False,
     use_fast_gpu: bool = False,
     runtime_seconds: int = 3600,
+    memory_mb: int = 0,
+    cpus: int = 0,
 ):
     jobs_dir = "jobs"
     os.makedirs(jobs_dir, exist_ok=True)
@@ -43,6 +45,13 @@ def create_job(
             '(GPUs_DeviceName == "Tesla V100-PCIE-32GB")'
         )
 
+    # Without an explicit request HTCondor hands out the slot default, which on
+    # these nodes came with 40 CPUs and ~87 GB -- and a training job that exceeds
+    # it is evicted and held ("gone over cgroup memory limit"), not slowed down.
+    if memory_mb:
+        lines.append(f"request_memory = {memory_mb}")
+    if cpus:
+        lines.append(f"request_cpus = {cpus}")
     lines.append(f"+MaxRuntime = {runtime_seconds}")
     lines.append("queue")
 
@@ -63,6 +72,10 @@ if __name__ == "__main__":
     argparser.add_argument('--runtime', help='maximum runtime of the job in seconds', type=int, required=True) 
     argparser.add_argument('--gpu', help='whether to request a gpu', action='store_true')
     argparser.add_argument('--fast_gpu', help='whether to request a fast gpu (A6000 or V100)', action='store_true')
+    argparser.add_argument('--memory', help='request_memory in MB. Unset uses the slot default, which '
+                                            'is what a job exceeds when it is evicted with "gone over '
+                                            'cgroup memory limit".', type=int, default=0)
+    argparser.add_argument('--cpus', help='request_cpus. Unset uses the slot default.', type=int, default=0)
     args = argparser.parse_args()
 
     # parse command to get python script and its arguments
@@ -88,6 +101,8 @@ if __name__ == "__main__":
         use_gpu=args.gpu,
         use_fast_gpu=args.fast_gpu,
         runtime_seconds=args.runtime,
+        memory_mb=args.memory,
+        cpus=args.cpus,
     )
     print(f"Created submission file: {submission_file} and shell file: {sh_file}")
     submit_job(submission_file)
