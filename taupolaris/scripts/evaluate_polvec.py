@@ -28,8 +28,9 @@ Run (from the DiTauEntanglement directory):
     python3 taupolaris/scripts/evaluate_polvec.py --config config_polvec.yaml --max_events 2000
 """
 import argparse
+import time
 import glob
-import json
+import shutil
 import os
 import numpy as np
 import pandas as pd
@@ -219,66 +220,6 @@ def _predict_over_chunks(model, X, dataset, args, nn_config, cache_dir, n_events
               f"pred_phiCP_err is NaN there.")
     predictions = np.concatenate(map_parts, axis=0) if len(map_parts) > 1 else map_parts[0]
     return predictions, phicp_err
-
-
-def _model_fingerprint(model_path):
-    """Identity of the weights a cache was built from.
-
-    Chunk files are named by event range only, so nothing in the cache itself
-    distinguishes one set of weights from another. Retraining the same
-    model_name for more epochs overwrites the .pth in place and leaves
-    output_dir -- and therefore the cache directory -- identical, so stale
-    chunks stay indistinguishable from fresh ones.
-    """
-    st = os.stat(model_path)
-    return {'model_path': os.path.abspath(model_path),
-            'mtime': st.st_mtime, 'size': st.st_size}
-
-
-def check_cache_matches_model(cache_dir, model_path, args):
-    """Refuse to reuse a cache built from different weights.
-
-    Returns nothing; raises if the cache is stale and --clear_cache was not
-    given. A cache with no stamp predates this check, so it can only be warned
-    about, not verified.
-    """
-    stamp_f = os.path.join(cache_dir, '_stamp.json')
-    current = _model_fingerprint(model_path)
-    existing = None
-    if os.path.exists(stamp_f):
-        try:
-            with open(stamp_f) as fh:
-                existing = json.load(fh)
-        except Exception:
-            existing = None
-
-    chunks = glob.glob(os.path.join(cache_dir, 'map_*.npy')) + \
-             glob.glob(os.path.join(cache_dir, 'phicperr_*.npy'))
-
-    stale = existing is not None and any(existing.get(k) != current[k]
-                                         for k in ('model_path', 'mtime', 'size'))
-
-    if chunks and args.clear_cache:
-        print(f">> --clear_cache: deleting {len(chunks)} cached chunks from {cache_dir}")
-        for f in chunks:
-            os.remove(f)
-        chunks = []
-
-    if chunks and stale:
-        raise RuntimeError(
-            f"{cache_dir} holds {len(chunks)} cached chunks built from different weights "
-            f"(cached mtime {existing.get('mtime')}, current {current['mtime']}). "
-            f"--from_cache would plot the OLD model and --resume would mix old and new "
-            f"chunks together, both silently. Rerun with --clear_cache to delete them, "
-            f"or remove the directory by hand:\n    rm -rf {cache_dir}")
-
-    if chunks and existing is None:
-        print(f">> WARNING: {cache_dir} holds {len(chunks)} cached chunks with no model stamp "
-              f"(written before this check existed). Cannot verify they came from "
-              f"{os.path.basename(model_path)} -- delete them if unsure.")
-
-    with open(stamp_f, 'w') as fh:
-        json.dump(current, fh)
 
 
 def contiguous_cached_chunks(cache_dir, kind, n_events):
@@ -557,12 +498,6 @@ def main():
     argparser.add_argument('--num_bins', type=int, default=50)
     argparser.add_argument('--oneprong', action='store_true', help='whether to only evaluate on 1-prong taus only')
     argparser.add_argument('--threeprong', action='store_true', help='whether to only evaluate on events with at least 1 3-prong tau')
-    argparser.add_argument('--clear_cache', action='store_true',
-                           help='delete every cached MAP/phiCP-error chunk for the datasets being '
-                                'evaluated before running, so everything is recomputed from the '
-                                'current weights. Needed when a model has been retrained under the '
-                                'same model_name, since the cache is keyed by event range only and '
-                                'cannot otherwise tell old chunks from new ones.')
     argparser.add_argument('--from_cache', action='store_true',
                            help='skip the MAP prediction entirely and build the outputs from the '
                                 'chunks already cached in <outdir>/_cache, truncating to however '
@@ -607,16 +542,38 @@ def main():
     norm_data = np.load(f'{output_dir}/normalization_params.npz')
 
     # --- load model (same for every test_dataset below) ---
-    # prefer the final saved model (written once training completes); fall back to
-    # the best/partial checkpoints under plots/ (same convention as evaluate.py) so
-    # this also works against a still-training or interrupted run.
+    # best_model.pth is the lowest-validation-loss checkpoint (NN_Tools.train_model);
+    # {model_name}.pth is whatever the final epoch happened to land on and partial_model.pth
+    # is the last periodic checkpoint. Prefer the best, falling back to the others only so
+    # this still works against a run with no plots/ directory.
     output_plots_dir = os.path.join(output_dir, 'plots')
-    model_path = os.path.join(output_dir, f"{nn_config['model_name']}.pth")
-    if not os.path.exists(model_path):
-        model_path = os.path.join(output_plots_dir, 'best_model.pth')
-    if not os.path.exists(model_path):
-        model_path = os.path.join(output_plots_dir, 'partial_model.pth')
-    print(f">> Loading model weights from {model_path}")
+    reuse_cache = args.resume or args.from_cache
+    snapshot_path = os.path.join(output_dir, '_cache', 'eval_model.pth')
+    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+
+    if reuse_cache and os.path.exists(snapshot_path):
+        # The cache is being continued or replotted, so it must be read with the
+        # weights that produced it. Training may well have overwritten
+        # best_model.pth since, which would silently mix two models' predictions.
+        model_path = snapshot_path
+        print(f">> Reusing the cached run's frozen weights {snapshot_path} "
+              f"(written {time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(snapshot_path)))})")
+    else:
+        source_path = os.path.join(output_plots_dir, 'best_model.pth')
+        if not os.path.exists(source_path):
+            source_path = os.path.join(output_dir, f"{nn_config['model_name']}.pth")
+        if not os.path.exists(source_path):
+            source_path = os.path.join(output_plots_dir, 'partial_model.pth')
+        if reuse_cache:
+            print(f">> WARNING: --resume/--from_cache given but no frozen snapshot at {snapshot_path} "
+                  f"(cache predates snapshotting). Falling back to {source_path}; if training has "
+                  f"advanced since the cache was written, the cached chunks came from other weights.")
+        # Copy rather than read in place: best_model.pth is rewritten every time
+        # validation improves, so evaluating a still-training model directly would
+        # let the weights change underneath a run that takes hours.
+        shutil.copy2(source_path, snapshot_path)
+        model_path = snapshot_path
+        print(f">> Loading model weights from {source_path} (frozen for this run as {snapshot_path})")
     # map_location='cpu' always works regardless of what device the checkpoint was
     # saved on (and regardless of whether a GPU is available here); the model is
     # moved to the target device separately below.
@@ -689,7 +646,16 @@ def main():
         # its work.
         cache_dir = os.path.join(output_dir, '_cache', test_output_name)
         os.makedirs(cache_dir, exist_ok=True)
-        check_cache_matches_model(cache_dir, model_path, args)
+        if not reuse_cache:
+            # A run that is neither resuming nor replotting recomputes everything from
+            # the snapshot just taken, so anything already here came from other weights.
+            stale = glob.glob(os.path.join(cache_dir, 'map_*.npy')) + \
+                    glob.glob(os.path.join(cache_dir, 'phicperr_*.npy'))
+            if stale:
+                print(f">> Clearing {len(stale)} cached chunks from {cache_dir} "
+                      f"(fresh run -- pass --resume to keep them)")
+                for f in stale:
+                    os.remove(f)
         n_events = len(df)
         block = chunk_size
 
