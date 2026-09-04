@@ -29,6 +29,7 @@ Run (from the DiTauEntanglement directory):
 """
 import argparse
 import glob
+import json
 import os
 import numpy as np
 import pandas as pd
@@ -218,6 +219,66 @@ def _predict_over_chunks(model, X, dataset, args, nn_config, cache_dir, n_events
               f"pred_phiCP_err is NaN there.")
     predictions = np.concatenate(map_parts, axis=0) if len(map_parts) > 1 else map_parts[0]
     return predictions, phicp_err
+
+
+def _model_fingerprint(model_path):
+    """Identity of the weights a cache was built from.
+
+    Chunk files are named by event range only, so nothing in the cache itself
+    distinguishes one set of weights from another. Retraining the same
+    model_name for more epochs overwrites the .pth in place and leaves
+    output_dir -- and therefore the cache directory -- identical, so stale
+    chunks stay indistinguishable from fresh ones.
+    """
+    st = os.stat(model_path)
+    return {'model_path': os.path.abspath(model_path),
+            'mtime': st.st_mtime, 'size': st.st_size}
+
+
+def check_cache_matches_model(cache_dir, model_path, args):
+    """Refuse to reuse a cache built from different weights.
+
+    Returns nothing; raises if the cache is stale and --clear_cache was not
+    given. A cache with no stamp predates this check, so it can only be warned
+    about, not verified.
+    """
+    stamp_f = os.path.join(cache_dir, '_stamp.json')
+    current = _model_fingerprint(model_path)
+    existing = None
+    if os.path.exists(stamp_f):
+        try:
+            with open(stamp_f) as fh:
+                existing = json.load(fh)
+        except Exception:
+            existing = None
+
+    chunks = glob.glob(os.path.join(cache_dir, 'map_*.npy')) + \
+             glob.glob(os.path.join(cache_dir, 'phicperr_*.npy'))
+
+    stale = existing is not None and any(existing.get(k) != current[k]
+                                         for k in ('model_path', 'mtime', 'size'))
+
+    if chunks and args.clear_cache:
+        print(f">> --clear_cache: deleting {len(chunks)} cached chunks from {cache_dir}")
+        for f in chunks:
+            os.remove(f)
+        chunks = []
+
+    if chunks and stale:
+        raise RuntimeError(
+            f"{cache_dir} holds {len(chunks)} cached chunks built from different weights "
+            f"(cached mtime {existing.get('mtime')}, current {current['mtime']}). "
+            f"--from_cache would plot the OLD model and --resume would mix old and new "
+            f"chunks together, both silently. Rerun with --clear_cache to delete them, "
+            f"or remove the directory by hand:\n    rm -rf {cache_dir}")
+
+    if chunks and existing is None:
+        print(f">> WARNING: {cache_dir} holds {len(chunks)} cached chunks with no model stamp "
+              f"(written before this check existed). Cannot verify they came from "
+              f"{os.path.basename(model_path)} -- delete them if unsure.")
+
+    with open(stamp_f, 'w') as fh:
+        json.dump(current, fh)
 
 
 def contiguous_cached_chunks(cache_dir, kind, n_events):
@@ -496,6 +557,12 @@ def main():
     argparser.add_argument('--num_bins', type=int, default=50)
     argparser.add_argument('--oneprong', action='store_true', help='whether to only evaluate on 1-prong taus only')
     argparser.add_argument('--threeprong', action='store_true', help='whether to only evaluate on events with at least 1 3-prong tau')
+    argparser.add_argument('--clear_cache', action='store_true',
+                           help='delete every cached MAP/phiCP-error chunk for the datasets being '
+                                'evaluated before running, so everything is recomputed from the '
+                                'current weights. Needed when a model has been retrained under the '
+                                'same model_name, since the cache is keyed by event range only and '
+                                'cannot otherwise tell old chunks from new ones.')
     argparser.add_argument('--from_cache', action='store_true',
                            help='skip the MAP prediction entirely and build the outputs from the '
                                 'chunks already cached in <outdir>/_cache, truncating to however '
@@ -622,6 +689,7 @@ def main():
         # its work.
         cache_dir = os.path.join(output_dir, '_cache', test_output_name)
         os.makedirs(cache_dir, exist_ok=True)
+        check_cache_matches_model(cache_dir, model_path, args)
         n_events = len(df)
         block = chunk_size
 
