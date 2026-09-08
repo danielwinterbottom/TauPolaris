@@ -485,6 +485,63 @@ def plot_phiCP_cp_comparison(true_phiCP, pred_phiCP, w_cpeven, w_cpodd, title, o
     fig.tight_layout()
     fig.savefig(outpath, dpi=130)
     plt.close(fig)
+    return true_asym, pred_asym
+
+
+# Decay-mode pairs in the order used by the summary table, with the pair written
+# as (n charged prongs, n pi0) per leg. DM100 is the leptonic tau. The hadronic
+# and semileptonic blocks are printed only when the sample actually contains
+# them, so a hadronic-only run prints no tau_l rows and vice versa.
+PHICP_TABLE_HADRONIC = [
+    ((0, 0),   '1pi0pi0-1pi0pi0'),
+    ((0, 1),   '1pi0pi0-1pi1pi0'),
+    ((0, 2),   '1pi0pi0-1pi2pi0'),
+    ((0, 10),  '1pi0pi0-3pi0pi0'),
+    ((1, 1),   '1pi1pi0-1pi1pi0'),
+    ((1, 2),   '1pi1pi0-1pi2pi0'),
+    ((1, 10),  '1pi1pi0-3pi0pi0'),
+    ((2, 2),   '1pi2pi0-1pi2pi0'),
+    ((2, 10),  '1pi2pi0-3pi0pi0'),
+    ((10, 10), '3pi0pi0-3pi0pi0'),
+    ((0, 11),  '1pi0pi0-3pi1pi0'),
+    ((1, 11),  '1pi1pi0-3pi1pi0'),
+    ((2, 11),  '1pi2pi0-3pi1pi0'),
+    ((10, 11), '3pi0pi0-3pi1pi0'),
+    ((11, 11), '3pi1pi0-3pi1pi0'),
+]
+# keys are sorted tuples, matching how the plotting loop stores them
+PHICP_TABLE_SEMILEPTONIC = [
+    ((0, 100),  'tau_l-1pi0pi0'),
+    ((1, 100),  'tau_l-1pi1pi0'),
+    ((2, 100),  'tau_l-1pi2pi0'),
+    ((10, 100), 'tau_l-3pi0pi0'),
+    ((11, 100), 'tau_l-3pi1pi0'),
+]
+
+
+def print_asymmetry_table(asym_by_pair, heading):
+    """Predicted phiCP asymmetry per decay-mode pair, in paper-table order.
+
+    asym_by_pair is keyed by the sorted (dm_a, dm_b) tuple. Pairs with too few
+    events to plot are absent and are simply skipped, which is also what drops
+    the semileptonic block for a hadronic-only sample.
+    """
+    present = [[(lab, asym_by_pair[k]) for k, lab in rows if k in asym_by_pair]
+               for rows in (PHICP_TABLE_HADRONIC, PHICP_TABLE_SEMILEPTONIC)]
+    if not any(present):
+        return
+    width = max(len(lab) for rows in present for lab, _ in rows)
+    print(f"\n>> {heading}")
+    print(f"   {'Decay modes'.ljust(width)}  Asymmetry")
+    print(f"   {'-' * width}  ---------")
+    for i, rows in enumerate(present):
+        if not rows:
+            continue
+        if i and present[0]:
+            print(f"   {'-' * width}  ---------")
+        for lab, asym in rows:
+            print(f"   {lab.ljust(width)}  {asym:9.3f}")
+    print()
 
 
 def main():
@@ -977,16 +1034,19 @@ def main():
             dm_outdir = os.path.join(outdir, dm_subdir)
             os.makedirs(dm_outdir, exist_ok=True)
             min_events = 20
+            asym_by_pair = {}
             for dm_p, dm_n in dm_combs:
                 mask = ((dm_t1 == dm_p) & (dm_t2 == dm_n)) | ((dm_t1 == dm_n) & (dm_t2 == dm_p))
                 n_events = mask.sum()
                 if n_events < min_events:
                     continue
-                plot_phiCP_cp_comparison(
+                _, pred_asym = plot_phiCP_cp_comparison(
                     true_phiCP[mask], pred_phiCP_variant[mask], w_cpeven[mask], w_cpodd[mask],
                     f'DM{dm_p} - DM{dm_n} ({n_events} events)',
                     os.path.join(dm_outdir, f'{filename_stem}_DM{dm_p}_DM{dm_n}.pdf'), PHICP_BINS,
                 )
+                asym_by_pair[tuple(sorted((dm_p, dm_n)))] = pred_asym
+            print_asymmetry_table(asym_by_pair, f'{filename_stem}: predicted asymmetry by decay mode')
 
         if not have_weights:
             print(">> WARNING: tauspinner_wt_alpha0/90 not found in test dataframe -- "
