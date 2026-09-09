@@ -51,7 +51,7 @@ from taupolaris.utils.coordinate_conversions import (
     ConvertFromOrthonormalNRK_Predictions_PolVec_Angular,
 )
 from taupolaris.utils.kinematic_helpers import compute_spin_density_vars, boost, boost_vector
-from taupolaris.utils.acoplanarity_tools import compute_aco_polarimetric
+from taupolaris.utils.acoplanarity_tools import compute_aco_polarimetric, get_ditau_polarimetric
 
 M_TAU = 1.77686
 PHICP_BINS = 20  # phiCP always uses 20 bins, independent of --num_bins
@@ -270,6 +270,7 @@ def columns_needed(data_config, tau_labels, coordinates, leptonic_mode, availabl
     if leptonic_mode == 1:
         cols |= {f'reco_{t1}_lep_{c}' for c in ('e', 'px', 'py', 'pz')}
         cols |= {f'reco_{t1}_lep_ip{c}' for c in 'xyz'}
+    cols |= columns_for_regressed_tau_phicp(tau_labels)             # regressed-tau -> nu -> analytic h
     _AXES = ('n', 'r', 'k')
     cols |= {f'tauspinner_wt_alpha{a}' for a in (0, 45, 90)}
     cols |= {f'wt_hp_{a}' for a in _AXES} | {f'wt_hm_{a}' for a in _AXES}
@@ -310,6 +311,73 @@ def tau_directions_com(tau1_p3, tau2_p3, tau1_E, tau2_E):
     tau1_4_com = boost(tau1_4, -com_boost)
     kx = unit(tau1_4_com[:, 1:])
     return kx, -kx  # tau1 direction, tau2 direction
+
+
+def phicp_from_regressed_taus(df, p_t1, p_t2, E_t1, E_t2, dm_t1, dm_t2, tau_labels):
+    """phiCP by the neutrino-regression route, but fed the regressed tau momenta.
+
+    The nu-method evaluation (evaluate.py) forms nu = tau - visible and then
+    recomputes the polarimetric vectors analytically per decay mode with
+    get_ditau_polarimetric, whose neutrino is exactly that subtraction (with a
+    ghost particle guarding nu -> 0). Feeding it the direct model's regressed
+    taus gives a phiCP that uses the model only for the tau momenta and the
+    closed-form physics for h -- directly comparable with the nu-method's own
+    map_pred_phiCP, and a check on how much of the gap to it is the polvec
+    regression rather than the tau regression.
+
+    get_ditau_polarimetric hardcodes taup/taun column names and takes the tau
+    charge into the DM10/DM11 formulas, so the two legs are mapped to tau+/tau-
+    per event: fixed by the labels in hadronic mode, from the stored charge in
+    semileptonic mode (tau1 is the leptonic leg there regardless of charge). It
+    also wants the pion energies as *_E while the prepared data stores *_e.
+
+    Returns phiCP (N,), and h for t1 and t2 as (N,3) arrays in the same frame and
+    convention as the nu-method evaluation's polarimetric vectors.
+    """
+    t1, t2 = tau_labels
+    n = len(df)
+    if tuple(tau_labels) == ('taup', 'taun'):
+        t1_is_plus = np.ones(n, dtype=bool)
+    else:
+        t1_is_plus = df[f'{t1}_charge'].values > 0
+
+    def pick(a1, a2):
+        # per-row: a1 where t1 is the tau+, else a2
+        return np.where(t1_is_plus, a1, a2)
+
+    tmp = {}
+    for part in ('pi1', 'pi2', 'pi3', 'pizero1', 'charged'):
+        for c in ('px', 'py', 'pz', 'e'):
+            a1 = df[f'reco_{t1}_{part}_{c}'].values
+            a2 = df[f'reco_{t2}_{part}_{c}'].values
+            out = 'E' if c == 'e' else c
+            tmp[f'reco_taup_{part}_{out}'] = pick(a1, a2)
+            tmp[f'reco_taun_{part}_{out}'] = pick(a2, a1)
+    tau1_4 = np.column_stack([E_t1, p_t1])
+    tau2_4 = np.column_stack([E_t2, p_t2])
+    for i, c in enumerate(('E', 'px', 'py', 'pz')):
+        tmp[f'derived_tau_plus_{c}'] = pick(tau1_4[:, i], tau2_4[:, i])
+        tmp[f'derived_tau_minus_{c}'] = pick(tau2_4[:, i], tau1_4[:, i])
+    tmp['taup_DM'] = pick(dm_t1, dm_t2)
+    tmp['taun_DM'] = pick(dm_t2, dm_t1)
+    tmp = pd.DataFrame(tmp)
+
+    R1, P1, R2, P2 = get_ditau_polarimetric(tmp, tau_prefix='derived', reco_pions=True)
+    phicp = ak.to_numpy(compute_aco_polarimetric(R1, P1, R2, P2))
+    h_plus = np.column_stack([ak.to_numpy(R1.x), ak.to_numpy(R1.y), ak.to_numpy(R1.z)])
+    h_minus = np.column_stack([ak.to_numpy(R2.x), ak.to_numpy(R2.y), ak.to_numpy(R2.z)])
+    sel = t1_is_plus[:, None]
+    return phicp, np.where(sel, h_plus, h_minus), np.where(sel, h_minus, h_plus)
+
+
+def columns_for_regressed_tau_phicp(tau_labels):
+    """Input columns phicp_from_regressed_taus needs beyond the eval's usual set."""
+    cols = set()
+    for t in tau_labels:
+        for part in ('pi1', 'pi2', 'pi3', 'pizero1', 'charged'):
+            cols |= {f'reco_{t}_{part}_{c}' for c in ('px', 'py', 'pz', 'e')}
+        cols.add(f'{t}_charge')
+    return cols
 
 
 def leptonic_polvec_from_tau_and_lepton(tau4, other_tau4, lep4):
@@ -985,6 +1053,22 @@ def main():
                 print(f">> WARNING: {lep_cols} not all found in test dataframe -- "
                       "skipping leptonic-leg (regressed-tau/Run3) polarimetric variables.")
 
+        # === 3''. regressed taus -> neutrino by subtraction -> analytic polarimetric
+        # vectors, i.e. the nu-method's own route fed with this model's taus. Both
+        # legs are replaced, unlike the leptonic-only variants above.
+        pred_phiCP_derivedNu = pred_h_t1_derivedNu = pred_h_t2_derivedNu = None
+        _need = columns_for_regressed_tau_phicp(tau_labels)
+        if tuple(tau_labels) == ('taup', 'taun'):
+            _need = {c for c in _need if not c.endswith('_charge')}   # fixed by the labels
+        _missing = sorted(c for c in _need if c not in df.columns)
+        if _missing:
+            print(f">> Skipping regressed-tau -> nu -> analytic-h phiCP: missing {_missing[:4]}"
+                  f"{' ...' if len(_missing) > 4 else ''}")
+        else:
+            print(">> Computing phiCP from regressed taus via the nu-method route (nu = tau - visible)...")
+            pred_phiCP_derivedNu, pred_h_t1_derivedNu, pred_h_t2_derivedNu = phicp_from_regressed_taus(
+                df, pred_p_t1, pred_p_t2, pred_E_t1, pred_E_t2, reco_dm_t1, reco_dm_t2, tau_labels)
+
         # === 3a. phiCP uncertainty ===
         # Computed alongside MAP in _predict_over_chunks above rather than in a
         # second pass over the sample, so both advance chunk by chunk and
@@ -1059,6 +1143,11 @@ def main():
             print(">> Plotting derived (regressed-tau + lepton) phiCP (all events + per decay-mode combination)...")
             _plot_phiCP_suite(pred_phiCP_derived, 'phiCP_derivedApproxLep', 'phiCP_by_dm_derivedApproxLep')
             print(f">> Saved derived phiCP plots to {outdir}")
+
+        if pred_phiCP_derivedNu is not None:
+            print(">> Plotting regressed-tau -> nu -> analytic-h phiCP (all events + per decay-mode combination)...")
+            _plot_phiCP_suite(pred_phiCP_derivedNu, 'phiCP_derivedNu', 'phiCP_by_dm_derivedNu')
+            print(f">> Saved regressed-tau phiCP plots to {outdir}")
 
         if pred_R_t1_run3lep is not None:
             print(">> Plotting Run3-classic lepton-side (R, P) phiCP (all events + per decay-mode combination)...")
@@ -1219,6 +1308,16 @@ def main():
         # Note R is the (ditau-frame-boosted) lepton impact parameter, not a unit
         # polarimetric vector -- kept unnormalised to match get_R_P_vectors_all's
         # own R_lep_ip convention.
+        # regressed taus -> nu -> analytic h, both legs (nu-method frame/convention,
+        # so comparable with evaluate.py's polarimetric vectors, not with the
+        # pred_ts_hh_* above -- see compare_polvec_methods.py for the basis change).
+        if pred_phiCP_derivedNu is not None:
+            for t, h in ((t1, pred_h_t1_derivedNu), (t2, pred_h_t2_derivedNu)):
+                results_df[f'pred_ts_hh_derivedNu_{t}_x'] = h[:, 0]
+                results_df[f'pred_ts_hh_derivedNu_{t}_y'] = h[:, 1]
+                results_df[f'pred_ts_hh_derivedNu_{t}_z'] = h[:, 2]
+            results_df['pred_phiCP_derivedNu'] = pred_phiCP_derivedNu
+
         if pred_R_t1_run3lep is not None:
             results_df[f'pred_R_run3lep_{t1}_x'] = pred_R_t1_run3lep[:, 0]
             results_df[f'pred_R_run3lep_{t1}_y'] = pred_R_t1_run3lep[:, 1]
