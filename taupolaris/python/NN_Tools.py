@@ -95,6 +95,64 @@ def load_model(hp, input_features, output_features, batch_norm=False, useMLP=Fal
     return model
 
 
+def build_lr_scheduler(optimizer, hp, steps_per_epoch):
+    """Per-batch LR schedule, selected by hp['lr_schedule'].
+
+    'cosine' (default): linear warmup over warmup_frac of the run, then cosine
+        annealing to lr*lr_min_factor. This is the schedule every existing model
+        was trained with and is built from the same objects, so leaving the key
+        out of a config changes nothing.
+
+    'wsd' (warmup-stable-decay): the same warmup, then the LR is held constant
+        until the last decay_frac of the run, where it decays linearly to
+        lr*lr_min_factor. The constant middle is what makes a run extendable:
+        raising n_epochs on a reloaded model continues at the plateau LR instead
+        of re-warming to the peak (a fresh cosine) or stepping past T_max (a
+        reloaded cosine, which sends CosineAnnealingLR's recursive update to
+        absurd values). The final drop in loss comes from the decay phase, so
+        it happens whenever the run is actually ended rather than at a T_max
+        fixed when the scheduler was built.
+    """
+    schedule = hp.get('lr_schedule', 'cosine')
+    n_epochs = hp['num_epochs']
+    total_steps = n_epochs * steps_per_epoch
+    warmup_frac = hp.get('warmup_frac', 0.05)
+    lr_min_factor = hp.get('lr_min_factor', 0.01)
+    warmup_steps = int(warmup_frac * total_steps)
+    lr = hp['lr']
+    start_factor = 1e-3   # warmup starts at 0.1% of lr
+
+    if schedule == 'cosine':
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=start_factor, total_iters=warmup_steps)
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps - warmup_steps, eta_min=lr * lr_min_factor)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+        print(f">> LR schedule: cosine -- warmup to {lr:.2e} over {warmup_steps / steps_per_epoch:.1f} epochs, "
+              f"cosine to {lr * lr_min_factor:.2e} at epoch {n_epochs}")
+    elif schedule == 'wsd':
+        decay_frac = hp.get('decay_frac', 0.2)
+        decay_steps = int(decay_frac * total_steps)
+        decay_start = total_steps - decay_steps
+
+        def factor(step):
+            if step < warmup_steps:
+                return start_factor + (1.0 - start_factor) * step / max(warmup_steps, 1)
+            if step < decay_start:
+                return 1.0
+            t = min((step - decay_start) / max(decay_steps, 1), 1.0)
+            return 1.0 + (lr_min_factor - 1.0) * t
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=factor)
+        print(f">> LR schedule: wsd -- warmup to {lr:.2e} over {warmup_steps / steps_per_epoch:.1f} epochs, "
+              f"constant until epoch {decay_start / steps_per_epoch:.1f}, "
+              f"linear decay to {lr * lr_min_factor:.2e} at epoch {n_epochs}")
+    else:
+        raise ValueError(f"Unknown lr_schedule '{schedule}' -- expected 'cosine' or 'wsd'")
+    return scheduler
+
+
 def setup_model_and_training(hp, train_dataset, test_dataset, input_features, output_features, model_name, verbose=True, reload=False, reload_scheduler=False, reset_training=False, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, polvec_feature_level=0):
     train_dataloader = DataLoader(train_dataset, batch_size=hp['batch_size'], shuffle=True)
     test_dataloader = DataLoader(test_dataset, batch_size=hp['batch_size'], shuffle=False)
@@ -147,29 +205,8 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
     scheduler = None
     es = None
 
-    # use cos annealing schedule with warm up period:
-    total_steps = hp['num_epochs'] * len(train_dataloader)
-    warmup_steps = int(0.05 * total_steps)  # e.g. 5% warmup
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=hp['lr'])
-    
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1e-3,   # start at 0.1% of lr
-        total_iters=warmup_steps
-    )
-    
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps - warmup_steps,
-        eta_min=hp['lr']*0.01
-    )
-    
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps]
-    )
+    scheduler = build_lr_scheduler(optimizer, hp, len(train_dataloader))
 
     output_plots_dir = f'outputs_{model_name}/plots'
 
@@ -230,7 +267,7 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
 
 def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=10, device="cpu", verbose=True, output_plots_dir=None,
     save_every_N=None, recompute_train_loss=True, scheduler=None, early_stopper=None, useMLP=False, optuna_trial=None,
-    start_epoch=0, initial_history=None):
+    start_epoch=0, initial_history=None, clip_grad_norm=None):
     # nflows' StandardNormal distribution registers a float64 buffer (_log_z)
     # internally; MPS doesn't support float64, so cast to float32 before moving device.
     model.float().to(device)
@@ -248,8 +285,10 @@ def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=
             optimizer.zero_grad()
             loss = _compute_loss(model, X, y, w, useMLP, mlp_loss_fn)
             loss.backward()
-            # Lucas experimented here
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if clip_grad_norm:
+                # bounds the rare huge gradients from the spline tails that otherwise
+                # show up as one-epoch loss spikes; off unless hp['clip_grad_norm'] > 0
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
             optimizer.step()
 
             lr = scheduler.get_last_lr()

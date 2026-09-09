@@ -17,7 +17,16 @@ SetupNN:
               'd_model': 256,
               'nhead': 2,
               'num_transformer_layers': 4,
-              'dropout': 0.0}
+              'dropout': 0.0,
+              # --- LR schedule (NN_Tools.build_lr_scheduler). 'cosine' is the existing default and is unchanged.
+              # 'wsd' = warmup -> constant at lr -> linear decay over the last decay_frac of the run; lets a run be
+              # extended by raising n_epochs without re-warming to the peak. Suggested with it: 'lr': 0.00015 and
+              # 'clip_grad_norm': 1.0 (the loss spikes in the cosine runs stop once lr falls below ~1e-4).
+              'lr_schedule': 'cosine',
+              'warmup_frac': 0.05,
+              'decay_frac': 0.2,        # wsd only
+              'lr_min_factor': 0.01,    # final lr = lr * lr_min_factor (both schedules)
+              'clip_grad_norm': 0.0}    # 0 = off (current behaviour); e.g. 1.0 clips the gradient norm every step
   MLP_hyperparams: { # for MLP baseline
               'batch_size': 8192,
               'num_blocks': 6,

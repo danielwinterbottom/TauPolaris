@@ -70,7 +70,7 @@ if __name__ == "__main__":
 
     # Train — TransformerBaseline uses MSE loss, same as useMLP
     use_mse_loss = args.useMLP or args.useTransformerBaseline
-    best_val_loss, history = train_model(model, optimizer, train_loader, val_loader, num_epochs=nn_config['n_epochs'], device=device, verbose=True, output_plots_dir=output_plots_dir, save_every_N=1, scheduler=scheduler, early_stopper=es, useMLP=use_mse_loss, start_epoch=start_epoch, initial_history=initial_history)
+    best_val_loss, history = train_model(model, optimizer, train_loader, val_loader, num_epochs=nn_config['n_epochs'], device=device, verbose=True, output_plots_dir=output_plots_dir, save_every_N=1, scheduler=scheduler, early_stopper=es, useMLP=use_mse_loss, start_epoch=start_epoch, initial_history=initial_history, clip_grad_norm=hp.get('clip_grad_norm'))
 
     model_name = nn_config['model_name']
     torch.save(model.state_dict(), f'{output_dir}/{model_name}.pth')
