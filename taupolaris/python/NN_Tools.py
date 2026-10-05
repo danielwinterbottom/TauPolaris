@@ -56,7 +56,7 @@ def is_legacy_pizero_proj_checkpoint(state_dict):
     return not any(k.endswith('condition_net.pizero_proj.weight') for k in state_dict)
 
 
-def load_model(hp, input_features, output_features, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, legacy_pizero_proj=False, polvec_feature_level=0):
+def load_model(hp, input_features, output_features, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, legacy_pizero_proj=False, polvec_feature_level=0, frame_aligned_level=0, context_hidden_layer=False):
     if useMLP:
         model = MLP(input_size=len(input_features), output_size=len(output_features), num_blocks=hp['num_blocks'],
                     hidden_size=hp['hidden_size'], activation=nn.GELU())
@@ -69,6 +69,8 @@ def load_model(hp, input_features, output_features, batch_norm=False, useMLP=Fal
             d_model=hp['d_model'], nhead=hp['nhead'],
             num_layers=hp['num_transformer_layers'],
             dropout=hp['dropout'],
+            polvec_feature_level=polvec_feature_level,
+            frame_aligned_level=frame_aligned_level,
         )
     elif useTransformer:
         model = ConditionalFlow(input_dim=len(output_features),
@@ -81,6 +83,8 @@ def load_model(hp, input_features, output_features, batch_norm=False, useMLP=Fal
                                 dropout=hp['dropout'],
                                 legacy_pizero_proj=legacy_pizero_proj,
                                 polvec_feature_level=polvec_feature_level,
+                                frame_aligned_level=frame_aligned_level,
+                                context_hidden_layer=context_hidden_layer,
                                 num_layers=hp['num_layers'], num_bins=hp['num_bins'],
                                 tail_bound=hp['tail_bound'], hidden_size=hp['hidden_size'],
                                 num_blocks=hp['num_blocks'], activation=nn.GELU())
@@ -153,7 +157,64 @@ def build_lr_scheduler(optimizer, hp, steps_per_epoch):
     return scheduler
 
 
-def setup_model_and_training(hp, train_dataset, test_dataset, input_features, output_features, model_name, verbose=True, reload=False, reload_scheduler=False, reset_training=False, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, polvec_feature_level=0):
+def init_condition_net_from(model, path, verbose=True):
+    """Initialise model.condition_net (the ParticleTransformerCondition of a
+    ConditionalFlow) from another checkpoint, leaving the flow itself at its
+    random initialisation. Nothing is frozen: this only sets the starting point.
+
+    Accepts either
+      * a TransformerRegressor checkpoint (encoder pretrained with a supervised
+        multi-target MSE, keys 'encoder.*'; the 'head.*' keys are ignored), or
+      * a ConditionalFlow checkpoint (keys 'condition_net.*'), e.g. the nu-method
+        model, whose conditioner is architecturally identical up to its input set.
+
+    The load is partial by design: every tensor whose name and shape match is
+    copied; a type_emb table with a different number of rows (a checkpoint with
+    fewer/more input tokens, e.g. without the hadronic-current tokens) has its
+    leading rows copied and the rest left at random init; anything else is left
+    untouched and reported. Fails loudly only if nothing at all could be copied.
+    """
+    sd = torch.load(path, map_location='cpu')
+    for prefix in ('encoder.', 'condition_net.'):
+        sub = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+        if sub:
+            break
+    else:
+        raise ValueError(f"{path} holds neither 'encoder.*' nor 'condition_net.*' tensors")
+    if prefix == 'encoder.':
+        # a regressor's first head layer (Linear context->context, then GELU) is the flow
+        # conditioner's optional context_hidden layer; only used if the model has one
+        for suffix in ('weight', 'bias'):
+            if f'head.0.{suffix}' in sd:
+                sub[f'context_hidden.0.{suffix}'] = sd[f'head.0.{suffix}']
+    target = model.condition_net.state_dict()
+    copied, partial, skipped = [], [], []
+    with torch.no_grad():
+        for name, dst in target.items():
+            if name not in sub:
+                skipped.append(f'{name} (absent)')
+                continue
+            src = sub[name]
+            if src.shape == dst.shape:
+                dst.copy_(src); copied.append(name)
+            elif name.endswith('type_emb.weight') and src.shape[1:] == dst.shape[1:]:
+                n = min(src.shape[0], dst.shape[0])
+                dst[:n].copy_(src[:n]); partial.append(f'{name} ({n}/{dst.shape[0]} rows)')
+            else:
+                skipped.append(f'{name} ({tuple(src.shape)} vs {tuple(dst.shape)})')
+    if not copied:
+        raise ValueError(f'no tensor of {path} matches model.condition_net')
+    model.condition_net.load_state_dict(target)
+    if verbose:
+        print(f">> condition_net initialised from {path} ('{prefix}' tensors): "
+              f"{len(copied)} copied, {len(partial)} partially copied, {len(skipped)} left at random init")
+        for m in partial + skipped:
+            print(f">>     {m}")
+    return copied, partial, skipped
+
+
+def setup_model_and_training(hp, train_dataset, test_dataset, input_features, output_features, model_name, verbose=True, reload=False, reload_scheduler=False, reset_training=False, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, polvec_feature_level=0, frame_aligned_level=0, condition_net_init=None, condition_net_freeze=False,
+                             context_hidden_layer=False):
     train_dataloader = DataLoader(train_dataset, batch_size=hp['batch_size'], shuffle=True)
     test_dataloader = DataLoader(test_dataset, batch_size=hp['batch_size'], shuffle=False)
 
@@ -175,6 +236,8 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
             d_model=hp['d_model'], nhead=hp['nhead'],
             num_layers=hp['num_transformer_layers'],
             dropout=hp['dropout'],
+            polvec_feature_level=polvec_feature_level,
+            frame_aligned_level=frame_aligned_level,
         )
     elif useTransformer:
         model = ConditionalFlow(input_dim=len(output_features),
@@ -186,6 +249,8 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
                                 num_transformer_layers=hp['num_transformer_layers'],
                                 dropout=hp['dropout'],
                                 polvec_feature_level=polvec_feature_level,
+                                frame_aligned_level=frame_aligned_level,
+                                context_hidden_layer=context_hidden_layer,
                                 num_layers=hp['num_layers'], num_bins=hp['num_bins'],
                                 tail_bound=hp['tail_bound'], hidden_size=hp['hidden_size'],
                                 num_blocks=hp['num_blocks'], activation=nn.GELU())
@@ -198,14 +263,34 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
                                 hidden_size=hp['hidden_size'], num_blocks=hp['num_blocks'],
                                 batch_norm=batch_norm, activation=nn.LeakyReLU(0.05))
 
+    if condition_net_init:
+        if reload:
+            print(f">> condition_net_init ignored because reload=True (the partial checkpoint already holds the weights)")
+        elif not hasattr(model, 'condition_net'):
+            raise ValueError('condition_net_init needs a ConditionalFlow model (use_transformer: True)')
+        else:
+            init_condition_net_from(model, condition_net_init, verbose=verbose)
+
+    if condition_net_freeze:
+        # keep the (pretrained) conditioner fixed: no gradients, and left out of the
+        # optimizer altogether so AdamW's weight decay cannot touch it either.
+        if not hasattr(model, 'condition_net'):
+            raise ValueError('condition_net_freeze needs a ConditionalFlow model (use_transformer: True)')
+        if not condition_net_init and not reload:
+            print(">> WARNING: condition_net_freeze=True without condition_net_init -- freezing a randomly initialised conditioner")
+        for p_ in model.condition_net.parameters():
+            p_.requires_grad_(False)
+        print(f">> condition_net FROZEN: {sum(p_.numel() for p_ in model.condition_net.parameters())} parameters excluded from training")
+
     if verbose:
         # print number of parameters
         total_params = sum(p.numel() for p in model.parameters())
-        print(f"Total number of model parameters: {total_params}")
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total number of model parameters: {total_params} (trainable: {trainable})")
     scheduler = None
     es = None
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=hp['lr'])
+    optimizer = torch.optim.AdamW([p_ for p_ in model.parameters() if p_.requires_grad], lr=hp['lr'])
     scheduler = build_lr_scheduler(optimizer, hp, len(train_dataloader))
 
     output_plots_dir = f'outputs_{model_name}/plots'

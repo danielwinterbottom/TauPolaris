@@ -79,7 +79,12 @@ class RegressionDataset(Dataset):
             self.input_mean[:, input_skip_mask] = 0.0
             self.input_std[:, input_skip_mask] = 1.0
 
-            X = (X - self.input_mean) / self.input_std
+            # in place: same arithmetic in the same order (bit-identical), but one copy of X
+            # instead of three -- `X = (X - m) / s` briefly held X, X-m and the result, which
+            # for the 72M-event all-channel training set (39 GB) blew the 88 GB job limit.
+            # X is always this dataset's own tensor here (a fresh array from the dataframe
+            # selection, or the preallocated one get_train_val_test_datasets streamed into).
+            X.sub_(self.input_mean).div_(self.input_std)
         else:
             self.input_mean = torch.zeros(X.shape[1])
             self.input_std = torch.ones(X.shape[1])
@@ -93,7 +98,7 @@ class RegressionDataset(Dataset):
                 self.output_mean = output_mean
                 self.output_std = output_std.clamp_min(eps)
 
-            y = (y - self.output_mean) / self.output_std
+            y.sub_(self.output_mean).div_(self.output_std)   # in place, as for X
         else:
             self.output_mean = torch.zeros(y.shape[1])
             self.output_std = torch.ones(y.shape[1])
@@ -428,6 +433,13 @@ def _process_chunk(df, config, collider, use_reco, prefix, charged_name, has_ts_
         df = _add_hadronic_current_features(df, prefix, charged_name,
                                             level=_polvec_feature_level)
 
+    # frame-aligned inputs (visible sum, then per-leg vectors in the leg's own
+    # (n,r,k) basis) -- opt-in, see _add_frame_aligned_features
+    _frame_aligned_level = _resolve_frame_aligned_level(config)
+    if _frame_aligned_level > 0:
+        df = _add_frame_aligned_features(df, prefix, charged_name,
+                                         level=_frame_aligned_level)
+
     return df.reset_index(drop=True)
 
 
@@ -714,6 +726,153 @@ def _add_hadronic_current_features(df, prefix, charged_name, level=1):
     return pd.concat([df, added], axis=1)
 
 
+def _resolve_frame_aligned_level(config):
+    """Data.frame_aligned_inputs -> integer level (see _add_frame_aligned_features).
+
+      0 / false / absent : off (default) -- no columns added, no extra tokens
+      1 / true           : the visible tau four-vector (charged + pi0 sum), one token per leg
+      2                  : level 1, plus the secondary vertex in the leg's (n,r,k) basis
+      3                  : level 2, plus every other per-leg vector (pi1, pi2, pi3, pi0,
+                           charged impact parameter) in the leg's (n,r,k) basis
+    """
+    level = config.get('frame_aligned_inputs', 0)
+    if isinstance(level, bool):
+        return 1 if level else 0
+    return int(level)
+
+
+# per-leg column suffixes produced by _add_frame_aligned_features at each level,
+# shared with NN_Models.ParticleTransformerCondition so the two cannot drift apart.
+FRAME_ALIGNED_COLUMNS = {
+    1: [('vis_', ('px', 'py', 'pz', 'e'))],
+    2: [('sv_', ('n', 'r', 'k'))],
+    3: [('pi1_', ('n', 'r', 'k')), ('pi2_', ('n', 'r', 'k')), ('pi3_', ('n', 'r', 'k')),
+        ('pizero1_', ('n', 'r', 'k')), ('charged_ip', ('n', 'r', 'k'))],
+}
+
+
+def frame_aligned_feature_names(level, tau, prefix='reco_'):
+    """All column names a leg carries up to `level`, e.g. reco_taup_vis_px, reco_taup_sv_n."""
+    names = []
+    for lv in range(1, level + 1):
+        for stem, comps in FRAME_ALIGNED_COLUMNS[lv]:
+            names += [f'{prefix}{tau}_{stem}{c}' for c in comps]
+    return names
+
+
+def _add_frame_aligned_features(df, prefix, charged_name, level=1):
+    """Frame-aligned input features (config Data.frame_aligned_inputs).
+
+    The regression targets live in each leg's visible-momentum (n,r,k) basis
+    (_build_nrk_basis_from_visible_tau), while every input vector is given in the
+    lab frame. The conditioner therefore has to sum the pions, build the basis and
+    rotate the secondary vertex / impact parameter / decay products into it before
+    it can say anything about the targets. These features do that arithmetic up
+    front. They add no information -- they are exact functions of columns the
+    model already sees -- only an inductive bias, in the same spirit as the
+    hadronic-current block (_add_hadronic_current_features), which is itself
+    expressed in this basis.
+
+      level 1: {prefix}{tau}_vis_{px,py,pz,e}        charged + pi0 four-vector (lab)
+      level 2: {prefix}{tau}_sv_{n,r,k}              secondary vertex in the leg basis
+      level 3: {prefix}{tau}_{pi1,pi2,pi3,pizero1}_{n,r,k}, {prefix}{tau}_charged_ip{n,r,k}
+
+    A column is computed for every leg regardless of decay mode (a 1-prong leg
+    simply has zero pi2/pi3/SV), exactly as the lab-frame columns are; the
+    transformer masks the corresponding tokens by decay mode, as it does for the
+    lab-frame ones. Off by default, so nothing changes unless the config asks.
+    """
+    from taupolaris.utils.coordinate_conversions import _build_nrk_basis_from_visible_tau
+
+    def vec(name, comps=('px', 'py', 'pz')):
+        return np.stack([df[f'{name}{c}'].values.astype(float) for c in comps], axis=1)
+
+    new_cols = {}
+    for tau in ('taup', 'taun'):
+        base = f'{prefix}{tau}_'
+        charged = vec(f'{base}{charged_name}_')
+        pi0 = vec(f'{base}pizero1_')
+        if level >= 1:
+            vis = charged + pi0
+            for i, c in enumerate(('px', 'py', 'pz')):
+                new_cols[f'{base}vis_{c}'] = vis[:, i]
+            new_cols[f'{base}vis_e'] = (df[f'{base}{charged_name}_e'].values.astype(float)
+                                        + df[f'{base}pizero1_e'].values.astype(float))
+        if level >= 2:
+            n_hat, r_hat, k_hat = _build_nrk_basis_from_visible_tau(
+                df, f'{base}{charged_name}_', f'{base}pizero1_')
+
+            def project(name, v):
+                new_cols[f'{name}n'] = np.sum(v * n_hat, axis=1)
+                new_cols[f'{name}r'] = np.sum(v * r_hat, axis=1)
+                new_cols[f'{name}k'] = np.sum(v * k_hat, axis=1)
+
+            project(f'{base}sv_', vec(f'{base}sv_', ('x', 'y', 'z')))
+        if level >= 3:
+            for part in ('pi1', 'pi2', 'pi3', 'pizero1'):
+                project(f'{base}{part}_', vec(f'{base}{part}_'))
+            project(f'{base}charged_ip', vec(f'{base}charged_ip', ('x', 'y', 'z')))
+
+    added = pd.DataFrame(new_cols, index=df.index)
+    clash = [c for c in added.columns if c in df.columns]
+    if clash:
+        df = df.drop(columns=clash)
+    return pd.concat([df, added], axis=1)
+
+
+def apply_channel_selection(df, config):
+    """The event selection of the train/val/test split (Data.leptonic_mode and the prong
+    options), and for leptonic_mode 1 the relabelling of the legs to tau1 (leptonic) /
+    tau2 (hadronic). Event-by-event, so it gives the same result on the whole dataframe
+    or on consecutive blocks of it -- make_eval_split.py relies on that to stream.
+    Factored out of _prepare_train_val_test_split unchanged."""
+    leptonic_mode = config.get('leptonic_mode', -1)
+    one_prong_only = config.get('one_prong_only', False)
+    match_n_prongs = config.get('match_n_prongs', False)
+    inc_three_prongs = config.get('inc_three_prongs', False)
+
+    if match_n_prongs:
+        # only select events where number of pions and number of elecron and muons match the gen-values
+        df = df[(df['taup_npi'] == df['reco_taup_npi']) & (df['taun_npi'] == df['reco_taun_npi'])]
+        df = df[(df['taup_nmu'] == df['reco_taup_nmu']) & (df['taun_nmu'] == df['reco_taun_nmu'])]
+        df = df[(df['taup_nele'] == df['reco_taup_nele']) & (df['taun_nele'] == df['reco_taun_nele'])]
+
+    if leptonic_mode == 0:
+        # select cases where both taus are hadronic
+        df = df[(df['taup_nmu'] == 0) & (df['taup_nele'] == 0) & (df['taun_nmu'] == 0) & (df['taun_nele'] == 0)]
+
+        #apply reco cuts as well
+        df = df[(df['reco_taup_nmu'] == 0) & (df['reco_taup_nele'] == 0) & (df['reco_taun_nmu'] == 0) & (df['reco_taun_nele'] == 0)]
+
+        if one_prong_only: # only train on 1-prong events (require both truth and reco level be 1-prong)
+            df = df[(df['taup_npi'] == 1) & (df['taun_npi'] == 1)]
+            df = df[(df['reco_taup_npi'] == 1) & (df['reco_taun_npi'] == 1)]
+
+        if inc_three_prongs: # only train on events with at least 1 3-prong tau
+            df = df[(df['taup_npi'] > 1) | (df['taun_npi'] > 1)]
+            df = df[(df['reco_taup_npi'] > 1) | (df['reco_taun_npi'] > 1)]
+
+    elif leptonic_mode == 1:
+        # select cases where one tau is leptonic and one is hadronic
+        df = df[((df['taup_nmu'] + df['taup_nele']) > 0) & ((df['taun_nmu'] + df['taun_nele']) == 0) |
+                ((df['taup_nmu'] + df['taup_nele']) == 0) & ((df['taun_nmu'] + df['taun_nele']) > 0)]
+
+        # apply reco cuts as well
+        df = df[((df['reco_taup_nmu'] + df['reco_taup_nele']) > 0) & ((df['reco_taun_nmu'] + df['reco_taun_nele']) == 0) |
+                ((df['reco_taup_nmu'] + df['reco_taup_nele']) == 0) & ((df['reco_taun_nmu'] + df['reco_taun_nele']) > 0)]
+
+        # restructure the dataframe so that the leptonic tau is always tau1 and the hadronic tau is always tau2
+        df = convert_semileptonic_df(df)
+
+    elif leptonic_mode == 2:
+        # select cases where both taus are leptonic
+        df = df[(df['taup_nmu'] + df['taup_nele'] > 0) & (df['taun_nmu'] + df['taun_nele'] > 0)]
+
+        # apply reco cuts as well
+        df = df[(df['reco_taup_nmu'] + df['reco_taup_nele'] > 0) & (df['reco_taun_nmu'] + df['reco_taun_nele'] > 0)]
+    return df
+
+
 def _prepare_train_val_test_split(k, config, train_df_path, val_df_path, test_df_path):
     """
     Reads dataset k's full dataframe, applies the leptonic_mode/prong
@@ -759,45 +918,7 @@ def _prepare_train_val_test_split(k, config, train_df_path, val_df_path, test_df
     # add a column to identify the dataset
     df['dataset'] = k
 
-    if match_n_prongs:
-        # only select events where number of pions and number of elecron and muons match the gen-values
-        df = df[(df['taup_npi'] == df['reco_taup_npi']) & (df['taun_npi'] == df['reco_taun_npi'])]
-        df = df[(df['taup_nmu'] == df['reco_taup_nmu']) & (df['taun_nmu'] == df['reco_taun_nmu'])]
-        df = df[(df['taup_nele'] == df['reco_taup_nele']) & (df['taun_nele'] == df['reco_taun_nele'])]
-
-    if leptonic_mode == 0:
-        # select cases where both taus are hadronic
-        df = df[(df['taup_nmu'] == 0) & (df['taup_nele'] == 0) & (df['taun_nmu'] == 0) & (df['taun_nele'] == 0)]
-
-        #apply reco cuts as well
-        df = df[(df['reco_taup_nmu'] == 0) & (df['reco_taup_nele'] == 0) & (df['reco_taun_nmu'] == 0) & (df['reco_taun_nele'] == 0)]
-
-        if one_prong_only: # only train on 1-prong events (require both truth and reco level be 1-prong)
-            df = df[(df['taup_npi'] == 1) & (df['taun_npi'] == 1)]
-            df = df[(df['reco_taup_npi'] == 1) & (df['reco_taun_npi'] == 1)]
-
-        if inc_three_prongs: # only train on events with at least 1 3-prong tau
-            df = df[(df['taup_npi'] > 1) | (df['taun_npi'] > 1)]
-            df = df[(df['reco_taup_npi'] > 1) | (df['reco_taun_npi'] > 1)]
-
-    elif leptonic_mode == 1:
-        # select cases where one tau is leptonic and one is hadronic
-        df = df[((df['taup_nmu'] + df['taup_nele']) > 0) & ((df['taun_nmu'] + df['taun_nele']) == 0) |
-                ((df['taup_nmu'] + df['taup_nele']) == 0) & ((df['taun_nmu'] + df['taun_nele']) > 0)]
-
-        # apply reco cuts as well
-        df = df[((df['reco_taup_nmu'] + df['reco_taup_nele']) > 0) & ((df['reco_taun_nmu'] + df['reco_taun_nele']) == 0) |
-                ((df['reco_taup_nmu'] + df['reco_taup_nele']) == 0) & ((df['reco_taun_nmu'] + df['reco_taun_nele']) > 0)]
-
-        # restructure the dataframe so that the leptonic tau is always tau1 and the hadronic tau is always tau2
-        df = convert_semileptonic_df(df)
-
-    elif leptonic_mode == 2:
-        # select cases where both taus are leptonic
-        df = df[(df['taup_nmu'] + df['taup_nele'] > 0) & (df['taun_nmu'] + df['taun_nele'] > 0)]
-
-        # apply reco cuts as well
-        df = df[(df['reco_taup_nmu'] + df['reco_taup_nele'] > 0) & (df['reco_taun_nmu'] + df['reco_taun_nele'] > 0)]
+    df = apply_channel_selection(df, config)
 
     train_size = int(config['train_fraction'] * len(df))
     val_size = int(config['val_fraction'] * len(df))

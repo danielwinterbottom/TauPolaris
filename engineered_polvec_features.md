@@ -356,3 +356,37 @@ tokenisation and is **not** wired up — the option has no effect there.
 | current + invariants, DM11 | `Polarimetric3hpi0_vectorised.hadronic_current()` |
 | feature construction | `acoplanarity_tools.hadronic_current_features()` |
 | prep-time wiring | `DataProcessing._add_hadronic_current_features()` |
+
+---
+
+# Frame-aligned inputs (`Data.frame_aligned_inputs`)
+
+A second, independent opt-in block, added 2026-09-22. Same mechanism as above
+(columns at preparation time, one masked transformer token each), different
+motivation: the regression targets live in each leg's visible-momentum (n,r,k)
+basis while every input vector is in the lab frame, so the conditioner has to
+sum the pions, build the basis and rotate the secondary vertex into it before it
+can address the targets. These features do that arithmetic up front. They add no
+information, only an inductive bias.
+
+| value | per hadronic leg |
+|---|---|
+| `0` / absent | off — nothing changes |
+| `1` | `reco_{tau}_vis_{px,py,pz,e}`: the visible (charged + pi0) four-vector |
+| `2` | level 1 + `reco_{tau}_sv_{n,r,k}`: the secondary vertex in the leg basis (masked unless 3-prong) |
+| `3` | level 2 + `reco_{tau}_{pi1,pi2,pi3,pizero1}_{n,r,k}` and `reco_{tau}_charged_ip{n,r,k}` (masked like their lab-frame tokens) |
+
+Diagnosis that motivated it (Sep01 model vs the nu-method on 3.44M aligned test
+events): the direct model's tau *magnitude* is better on every decay mode, but its
+tau *direction* on 3-prong legs is ~60% worse (0.22° vs 0.13° median), and both its
+learned h and the analytic h from its own taus inherit exactly that deficit. The
+direction of a 3-prong tau is the SV direction expressed in the target basis.
+
+The columns can be added to already-prepared split files without re-preparing from
+ROOT with `taupolaris/scripts/augment_frame_aligned_inputs.py` (the split is
+deterministic, so the rows are identical), after which training uses `--loadDS`.
+The model checks the columns are present and raises otherwise. Level 0 builds
+exactly the previous architecture, so existing checkpoints load unchanged.
+
+Variants prepared: `config_polvec_hadonly_onorm_newvars_{vis,vis_svnrk,vis_allnrk}.yaml`
+(levels 1/2/3, otherwise identical to the Sep01 newvars setup).

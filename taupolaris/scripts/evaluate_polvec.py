@@ -1,7 +1,9 @@
 """
 Evaluation script for the direct polarimetric-vector / tau-momentum flow
 (config_polvec.yaml style models: 12 outputs = ts_hh_taup/taun (polarimetric
-vectors) + undecayed_taup/taun (tau momenta)).
+vectors) + undecayed_taup/taun (tau momenta), or, for the neutrino-target
+variant, + taup/taun_nu (nu = tau - reco visible, rebuilt into the tau at
+conversion time -- see tau_target_is_neutrino)).
 
 Compares true vs. predicted (MAP estimate):
   - tau 4-vectors (px, py, pz, E)
@@ -43,7 +45,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from taupolaris.python.DataProcessing import RegressionDataset, get_test_dataset, _resolve_polvec_feature_level
+from taupolaris.python.DataProcessing import RegressionDataset, get_test_dataset, _resolve_polvec_feature_level, _resolve_frame_aligned_level
 from taupolaris.python.NN_Tools import load_model, get_device, is_legacy_pizero_proj_checkpoint
 from taupolaris.python.Evaluation_Tools import flow_map_predict, plot_spin_density_matrix
 from taupolaris.utils.coordinate_conversions import (
@@ -75,6 +77,23 @@ def onorm_output_order(tau_labels):
         f'undecayed_{t1}_n', f'undecayed_{t1}_r', f'undecayed_{t1}_k',
         f'undecayed_{t2}_n', f'undecayed_{t2}_r', f'undecayed_{t2}_k',
     ]
+
+
+def tau_target_is_neutrino(output_features):
+    """True when the momentum half of the native output is the neutrino
+    ({tau}_nu_{n,r,k}, i.e. nu = tau - reco visible, the nu-method's own target)
+    rather than the undecayed tau (undecayed_{tau}_{n,r,k}). Both share the
+    visible-axis (n,r,k) basis and the same positions in output_features, so the
+    only difference downstream is that the neutrino variant needs the reco
+    visible momentum added back to give the tau -- see convert_native_to_cartesian.
+    The n and r components are identical between the two by construction (the
+    visible momentum lies along k); only k differs, by |p_vis|."""
+    has_nu = any(c.endswith('_nu_n') for c in output_features)
+    has_tau = any(c.startswith('undecayed_') and c.endswith('_n') for c in output_features)
+    if has_nu == has_tau:
+        raise ValueError("output_features must contain exactly one of undecayed_{tau}_n / "
+                         f"{{tau}}_nu_n momentum targets, got {output_features}")
+    return has_nu
 
 
 def angular_output_order(tau_labels):
@@ -149,12 +168,17 @@ def _predict_over_chunks(model, X, dataset, args, nn_config, cache_dir, n_events
 
     map_parts = []
     phicp_err = np.full(n_events, np.nan)
-    n_cached_map = n_cached_err = 0
+    phicp_mean = np.full(n_events, np.nan)
+    n_cached_map = n_cached_err = n_cached_mean = 0
 
     for bstart in tqdm(range(0, n_events, chunk_size), desc="Processing chunks (MAP+err)"):
         bstop = min(bstart + chunk_size, n_events)
         map_f = os.path.join(cache_dir, f'map_{bstart:09d}_{bstop:09d}.npy')
         err_f = os.path.join(cache_dir, f'phicperr_{bstart:09d}_{bstop:09d}.npy')
+        # sample count in the name, so runs with different --n_flow_samples sit side by side
+        smp_f = os.path.join(cache_dir, f'phicpsamples{n_fs}_{bstart:09d}_{bstop:09d}.npy')
+        # per-event circular mean of the sampled phiCP; n in the name because it depends on it
+        mean_f = os.path.join(cache_dir, f'phicpcircmean{n_fs}_{bstart:09d}_{bstop:09d}.npy')
 
         # ---- MAP ----
         if args.resume and os.path.exists(map_f):
@@ -173,10 +197,21 @@ def _predict_over_chunks(model, X, dataset, args, nn_config, cache_dir, n_events
         # ---- phiCP uncertainty for the same events ----
         if n_fs <= 0:
             continue
-        if args.resume and os.path.exists(err_f):
+        save_samples = getattr(args, 'save_phicp_samples', False)
+        have_err = args.resume and os.path.exists(err_f)
+        have_mean = args.resume and os.path.exists(mean_f)
+        if have_err:
             phicp_err[bstart:bstop] = np.load(err_f)
             n_cached_err += 1
+        if have_mean:
+            phicp_mean[bstart:bstop] = np.load(mean_f)
+            n_cached_mean += 1
+        # sample again only for what is missing; cached values are kept, never overwritten
+        # (so an older cache made with a different n_flow_samples keeps its error and gains
+        # the circular mean at the current n)
+        if have_err and have_mean and (not save_samples or os.path.exists(smp_f)):
             continue
+        chunk_samples = np.full((bstop - bstart, n_fs), np.nan, dtype=np.float32) if save_samples else None
         for start in range(bstart, bstop, err_chunk_size):
             end = min(start + err_chunk_size, bstop)
             C = end - start
@@ -195,7 +230,8 @@ def _predict_over_chunks(model, X, dataset, args, nn_config, cache_dir, n_events
                 except AssertionError:
                     continue
             if samples_norm is None:
-                phicp_err[start:end] = np.nan
+                if not have_err:
+                    phicp_err[start:end] = np.nan
                 continue
             samples_native = dataset.destandardize_outputs(samples_norm).cpu().numpy().reshape(C * n_fs, -1)
             samples_native_df = pd.DataFrame(samples_native, columns=output_features)
@@ -209,17 +245,28 @@ def _predict_over_chunks(model, X, dataset, args, nn_config, cache_dir, n_events
             E_t1_s = np.sqrt(np.sum(p_t1_s ** 2, axis=1) + M_TAU ** 2)
             E_t2_s = np.sqrt(np.sum(p_t2_s ** 2, axis=1) + M_TAU ** 2)
             phiCP_samples = phicp_from_cart(sample_cart_df, E_t1_s, E_t2_s, tau_labels).reshape(C, n_fs)
-            phicp_err[start:end] = circular_std(phiCP_samples, axis=1)
-        np.save(err_f, phicp_err[bstart:bstop])
+            if save_samples:
+                chunk_samples[start - bstart:end - bstart] = phiCP_samples
+            if not have_err:
+                phicp_err[start:end] = circular_std(phiCP_samples, axis=1)
+            if not have_mean:
+                phicp_mean[start:end] = circular_mean(phiCP_samples, axis=1)
+        if save_samples:
+            np.save(smp_f, chunk_samples)
+        if not have_err:
+            np.save(err_f, phicp_err[bstart:bstop])
+        if not have_mean:
+            np.save(mean_f, phicp_mean[bstart:bstop])
 
-    if n_cached_map or n_cached_err:
-        print(f">>   [resume] {n_cached_map} MAP and {n_cached_err} phiCP-error chunks from cache")
+    if n_cached_map or n_cached_err or n_cached_mean:
+        print(f">>   [resume] {n_cached_map} MAP, {n_cached_err} phiCP-error and {n_cached_mean} "
+              f"phiCP-circular-mean chunks from cache")
     n_bad = int(np.isnan(phicp_err).sum()) if n_fs > 0 else 0
     if n_bad:
         print(f"  WARNING: flow sampling failed after 5 retries for {n_bad} events; "
               f"pred_phiCP_err is NaN there.")
     predictions = np.concatenate(map_parts, axis=0) if len(map_parts) > 1 else map_parts[0]
-    return predictions, phicp_err
+    return predictions, phicp_err, phicp_mean
 
 
 def contiguous_cached_chunks(cache_dir, kind, n_events):
@@ -405,6 +452,13 @@ def leptonic_polvec_from_tau_and_lepton(tau4, other_tau4, lep4):
     return unit(-lep_trf[:, 1:])
 
 
+def circular_mean(angles, axis=-1):
+    """Circular mean in [0, 2pi): atan2(<sin>, <cos>). Used as a per-event phiCP point
+    estimate from the flow samples -- on Sep01 it beats the MAP in the CP asymmetry once
+    ~25 samples are used, by ~+4 points (vs the old method) at 100-200 samples."""
+    return np.arctan2(np.mean(np.sin(angles), axis=axis), np.mean(np.cos(angles), axis=axis)) % (2 * np.pi)
+
+
 def circular_std(angles, axis=-1):
     """Circular standard deviation (Mardia & Jupp), used instead of a plain np.std
     to estimate the flow-sampling error on phiCP. phiCP is periodic on [0, 2*pi),
@@ -431,13 +485,25 @@ def convert_native_to_cartesian(coordinates, native_df, onorm_cols, angular_cols
             reco_taup_charged=reco_t1_charged, reco_taup_pizero=reco_t1_pizero,
             reco_taun_charged=reco_t2_charged, reco_taun_pizero=reco_t2_pizero,
         )
+        if tau_target_is_neutrino(onorm_cols):
+            # columns 6:12 are then the neutrino momenta in Cartesian coordinates
+            # (the inverse basis transform is the same for any vector): the tau is
+            # nu + the reco visible momentum the basis was built from, which is
+            # exactly how the nu-method forms its tau (evaluate.py / get_ditau_polarimetric).
+            cart = np.array(cart, dtype=float, copy=True)
+            cart[:, 6:9] += reco_t1_charged + reco_t1_pizero
+            cart[:, 9:12] += reco_t2_charged + reco_t2_pizero
     elif coordinates == 'onorm_angular':
+        if tau_target_is_neutrino(angular_cols):
+            raise NotImplementedError("neutrino momentum targets are only supported with coordinates: onorm")
         cart = ConvertFromOrthonormalNRK_Predictions_PolVec_Angular(
             native_df[angular_cols].values,
             reco_taup_charged=reco_t1_charged, reco_taup_pizero=reco_t1_pizero,
             reco_taun_charged=reco_t2_charged, reco_taun_pizero=reco_t2_pizero,
         )
     elif coordinates == 'standard':
+        if tau_target_is_neutrino(cartesian_cols):
+            raise NotImplementedError("neutrino momentum targets are only supported with coordinates: onorm")
         cart = native_df[cartesian_cols].values
     else:
         raise ValueError(f"coordinates='{coordinates}' not supported by this script (only 'standard'/'onorm'/'onorm_angular')")
@@ -636,13 +702,27 @@ def main():
                                 'recomputing them, so an interrupted evaluation picks up where it '
                                 'stopped. Caches live in <outdir>/_cache and are keyed by event '
                                 'range, so this is safe to pass always.')
-    argparser.add_argument('--n_flow_samples', type=int, default=50,
-                            help='number of flow samples per event used to estimate an error on '
-                                 'pred_phiCP (circular std). <= 0 skips the estimate entirely and '
-                                 'leaves pred_phiCP_err as NaN -- this is a second expensive stage '
+    argparser.add_argument('--save_phicp_samples', action='store_true',
+                           help='also keep every event\'s raw flow-sampled phiCP values, per chunk, as '
+                                '<outdir>/_cache/<test>/phicpsamples<n>_*.npy (float32, events x n_flow_samples). '
+                                'With --resume the MAP and phiCP-error caches are reused and only the '
+                                'sampling reruns where no samples file exists yet. Used for the MAP vs '
+                                'sample-mean and calibration checks (analyse_phicp_samples.py).')
+    argparser.add_argument('--sampling_only', action='store_true',
+                           help='stop after the MAP/sampling chunk loop: no plots, and the results '
+                                'parquet is NOT rewritten. For filling the caches on a subset '
+                                '(--max_events) without overwriting a full evaluation\'s outputs.')
+    argparser.add_argument('--n_flow_samples', type=int, default=100,
+                            help='number of flow samples per event (default 100), used for the error on '
+                                 'pred_phiCP (circular std, pred_phiCP_err) and for pred_phiCP_circmean '
+                                 '(circular mean of the samples -- a better phiCP estimate than the MAP '
+                                 'once ~25+ samples are used). <= 0 skips both and leaves them NaN -- this is a second expensive stage '
                                  'on top of the MAP prediction, so it is worth turning off when the '
                                  'per-event error is not needed.')
     args = argparser.parse_args()
+    if args.sampling_only and not args.resume:
+        argparser.error('--sampling_only needs --resume: without it the cache (MAP included) would be '
+                        'cleared and the model re-snapshotted')
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
@@ -710,7 +790,10 @@ def main():
     model = load_model(nn_config['hyperparams'], input_features, output_features,
                         useTransformer=nn_config.get('use_transformer', True), leptonic_mode=leptonic_mode,
                         legacy_pizero_proj=legacy_pizero_proj,
-                        polvec_feature_level=_resolve_polvec_feature_level(data_config))
+                        polvec_feature_level=_resolve_polvec_feature_level(data_config),
+                        frame_aligned_level=_resolve_frame_aligned_level(data_config),
+                        # built to match the checkpoint rather than trusting the config
+                        context_hidden_layer=any(k.startswith('condition_net.context_hidden.') for k in state_dict))
     model.load_state_dict(state_dict)
     model.float().to(device)
     model.eval()
@@ -825,17 +908,30 @@ def main():
             n_have = int(np.isfinite(pred_phiCP_err).sum())
             print(f">> --from_cache: pred_phiCP_err available for {n_have}/{n_events} events "
                   f"(never recomputed here)")
+            pred_phiCP_circmean = np.full(n_events, np.nan)
+            mean_ns = sorted({int(os.path.basename(f)[len('phicpcircmean'):].split('_')[0])
+                              for f in glob.glob(os.path.join(cache_dir, 'phicpcircmean*_*.npy'))})
+            if mean_ns:
+                n_mean = mean_ns[-1]   # the most samples available
+                for cstart, cstop, cf in contiguous_cached_chunks(cache_dir, f'phicpcircmean{n_mean}', n_events)[0]:
+                    pred_phiCP_circmean[cstart:cstop] = np.load(cf)
+                print(f">> --from_cache: pred_phiCP_circmean ({n_mean} samples) available for "
+                      f"{int(np.isfinite(pred_phiCP_circmean).sum())}/{n_events} events")
         else:
             X, _ = dataset[:]
             X = X.to(device)
             print(f">> Running MAP prediction (method={nn_config.get('map_method', 'gradient')}) "
                   f"and phiCP uncertainty together, chunk by chunk...")
-            predictions_native, pred_phiCP_err = _predict_over_chunks(
+            predictions_native, pred_phiCP_err, pred_phiCP_circmean = _predict_over_chunks(
                 model, X, dataset, args, nn_config, cache_dir, n_events, chunk_size,
                 output_features, coordinates,
                 (onorm_cols, angular_cols, cartesian_cols),
                 (reco_t1_charged, reco_t1_pizero, reco_t2_charged, reco_t2_pizero),
                 tau_labels, device)
+            if args.sampling_only:
+                print(f">> --sampling_only: caches filled for {n_events} events in {cache_dir}; "
+                      f"skipping plots and NOT rewriting the results parquet")
+                continue
 
         pred_native_df = pd.DataFrame(predictions_native, columns=output_features)
 
@@ -1144,6 +1240,15 @@ def main():
             _plot_phiCP_suite(pred_phiCP_derived, 'phiCP_derivedApproxLep', 'phiCP_by_dm_derivedApproxLep')
             print(f">> Saved derived phiCP plots to {outdir}")
 
+        n_mean_ok = int(np.isfinite(pred_phiCP_circmean).sum())
+        if n_mean_ok == len(pred_phiCP_circmean) and n_mean_ok > 0:
+            print(">> Plotting phiCP from the circular mean of the flow samples (all events + per decay-mode combination)...")
+            _plot_phiCP_suite(pred_phiCP_circmean, 'phiCP_circmean', 'phiCP_by_dm_circmean')
+            print(f">> Saved circular-mean phiCP plots to {outdir}")
+        elif n_mean_ok:
+            print(f">> pred_phiCP_circmean only available for {n_mean_ok}/{len(pred_phiCP_circmean)} events -- "
+                  "stored in the results, but its plots/table are skipped (rerun with --resume to complete it)")
+
         if pred_phiCP_derivedNu is not None:
             print(">> Plotting regressed-tau -> nu -> analytic-h phiCP (all events + per decay-mode combination)...")
             _plot_phiCP_suite(pred_phiCP_derivedNu, 'phiCP_derivedNu', 'phiCP_by_dm_derivedNu')
@@ -1288,6 +1393,7 @@ def main():
             'true_phiCP': true_phiCP,
             'pred_phiCP': pred_phiCP,
             'pred_phiCP_err': pred_phiCP_err,
+            'pred_phiCP_circmean': pred_phiCP_circmean,
             f'gen_{t1}_DM': gen_dm_t1,
             f'gen_{t2}_DM': gen_dm_t2,
             f'reco_{t1}_DM': reco_dm_t1,
