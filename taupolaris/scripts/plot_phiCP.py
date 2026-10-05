@@ -36,9 +36,9 @@ options = {
 # single TauSpinner-reweightable ("uncorrelated") sample, used with --uncorrelated instead
 # of separate even/odd/mix files -- e.g. an evaluate_polvec.py output parquet, which carries
 # tauspinner_wt_alpha0/45/90 weight columns
-'uncorr': 'outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet',
+'uncorr': '../DiTauEntanglement/outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet',
 # 'uncorr': 'outputs_PlainTransformer_Uncorr_Masked_Hadronic_100e_July29/output_results.parquet',
-'sl_uncorr': 'outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_results.parquet',
+'sl_uncorr': '../DiTauEntanglement/outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_results.parquet',
 # 'sl_uncorr': 'outputs_PlainTransformer_Uncorr_Masked_Semileptonic_100e_Aug3/output_results.parquet',
 },
     'gen': {
