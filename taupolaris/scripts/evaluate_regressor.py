@@ -36,7 +36,7 @@ from taupolaris.scripts.evaluate_polvec import (add_DM, phicp_from_cart, normali
                                                 phicp_from_regressed_taus, columns_for_regressed_tau_phicp,
                                                 PHICP_TABLE_HADRONIC, PHICP_BINS, M_TAU)
 
-LEG_DMS = (0, 1, 2, 10, 11)
+LEG_DMS = (0, 1, 2, 10, 11, 100)     # 100 = leptonic leg (semileptonic / all-channel models)
 DM_PAIRS = [k for k, _ in PHICP_TABLE_HADRONIC]
 
 
@@ -256,7 +256,8 @@ def main():
             phi_nuvis, _, _ = phicp_from_regressed_taus(df, tau_from_nu[t1], tau_from_nu[t2], E_from_nu[t1], E_from_nu[t2],
                                                         dm[t1], dm[t2], tau_labels)
             variants['phiCP_nuvis'] = phi_nuvis
-        dm_pairs = [[0, 0], [0, 1], [1, 1], [2, 2], [1, 2], [0, 2], [10, 10], [0, 10], [1, 10], [2, 10],
+        dm_pairs = [[100, 0], [100, 1], [100, 2], [100, 10], [100, 11], [100, 100],
+                    [0, 0], [0, 1], [1, 1], [2, 2], [1, 2], [0, 2], [10, 10], [0, 10], [1, 10], [2, 10],
                     [0, 11], [1, 11], [2, 11], [10, 11], [11, 11]]
         edges = np.linspace(0, 2 * np.pi, PHICP_BINS + 1)
         for stem, phi in variants.items():
