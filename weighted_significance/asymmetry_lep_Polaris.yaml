@@ -1,0 +1,43 @@
+DM100DM0:
+  N: 488850
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - &id001 !!python/object/apply:numpy.dtype
+    args:
+    - f4
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - -1
+    - -1
+    - 0
+  - !!binary |
+    Sj4rPQ==
+DM100DM1:
+  N: 905158
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    5rZKPQ==
+DM100DM10:
+  N: 398626
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    ncJTPQ==
+DM100DM11:
+  N: 159274
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    +XTHOw==
+DM100DM2:
+  N: 633025
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    6eIVPQ==

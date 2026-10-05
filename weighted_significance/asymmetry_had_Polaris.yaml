@@ -1,0 +1,103 @@
+DM0DM0:
+  N: 122445
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - &id001 !!python/object/apply:numpy.dtype
+    args:
+    - f4
+    - false
+    - true
+    state: !!python/tuple
+    - 3
+    - <
+    - null
+    - null
+    - null
+    - -1
+    - -1
+    - 0
+  - !!binary |
+    rXWkPQ==
+DM0DM1:
+  N: 228768
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    T2SoPQ==
+DM0DM10:
+  N: 99806
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    AJO4PQ==
+DM0DM11:
+  N: 39878
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    rZJRPQ==
+DM0DM2:
+  N: 158697
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    vWB0PQ==
+DM10DM10:
+  N: 82059
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    ttDfPQ==
+DM10DM11:
+  N: 32809
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    cgCDPQ==
+DM11DM11:
+  N: 13135
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    ru8jPQ==
+DM1DM1:
+  N: 422370
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    tg+/PQ==
+DM1DM10:
+  N: 186499
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    S7/OPQ==
+DM1DM11:
+  N: 74969
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    eTFrPQ==
+DM1DM2:
+  N: 295162
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    CIOLPQ==
+DM2DM10:
+  N: 129698
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    fFqVPQ==
+DM2DM11:
+  N: 51569
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    stshPQ==
+DM2DM2:
+  N: 205642
+  asymmetry: !!python/object/apply:numpy._core.multiarray.scalar
+  - *id001
+  - !!binary |
+    HhhNPQ==
