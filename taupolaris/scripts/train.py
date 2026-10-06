@@ -95,9 +95,13 @@ if __name__ == "__main__":
         es_term = dict(fn=PhiCPEnergyScore(input_features, output_features, in_mean, in_std, out_mean, out_std,
                                            n_samples=int(hp.get('es_phicp_samples', 2))),
                        lam=float(hp['es_phicp_lambda']), fraction=float(hp.get('es_phicp_fraction', 1.0)),
-                       rampup_epochs=float(hp.get('es_phicp_rampup_epochs', 0)))
+                       rampup_epochs=float(hp.get('es_phicp_rampup_epochs', 0)),
+                       target=hp.get('es_phicp_target', 'all'))
+        es_term['fn'].perp_eps = float(hp.get('es_phicp_perp_eps', 0.05))
+        es_term['fn'].min_one_minus_beta2 = float(hp.get('es_phicp_min_one_minus_beta2', 1e-3))
         print(f">> phiCP energy-score term ON: lambda {es_term['lam']}, {hp.get('es_phicp_samples', 2)} samples/event, "
-              f"fraction {es_term['fraction']}, ramp-up {es_term['rampup_epochs']} epochs")
+              f"fraction {es_term['fraction']}, ramp-up {es_term['rampup_epochs']} epochs, gradient into: {es_term['target']}, "
+              f"softening perp_eps {es_term['fn'].perp_eps}, 1-beta^2 >= {es_term['fn'].min_one_minus_beta2}")
 
     # Train — TransformerBaseline uses MSE loss, same as useMLP
     use_mse_loss = args.useMLP or args.useTransformerBaseline

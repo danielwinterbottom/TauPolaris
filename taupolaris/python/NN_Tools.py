@@ -387,10 +387,12 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
 def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=10, device="cpu", verbose=True, output_plots_dir=None,
     save_every_N=None, recompute_train_loss=True, scheduler=None, early_stopper=None, useMLP=False, optuna_trial=None,
     start_epoch=0, initial_history=None, clip_grad_norm=None, es_term=None):
-    """es_term: optional dict(fn=PhiCPEnergyScore, lam=float, fraction=float, rampup_epochs=int) adding
+    """es_term: optional dict(fn=PhiCPEnergyScore, lam=float, fraction=float, rampup_epochs=int, target='all'|'conditioner') adding
     lam * (phiCP energy score) to the flow NLL (taupolaris/python/phicp_loss.py). During training lam
     ramps linearly from 0 over the first rampup_epochs epochs of this run; validation always uses the
-    full lam, so val_loss (and the best-model choice) has one fixed definition. The NLL and ES parts
+    full lam, so val_loss (and the best-model choice) has one fixed definition. target='conditioner' sends
+    the ES gradient only into the conditioner (the flow trains on the NLL alone); with either target a step
+    whose gradient is not finite is skipped. The NLL and ES parts
     are also stored separately in history (train_nll/train_es/val_nll/val_es)."""
     # nflows' StandardNormal distribution registers a float64 buffer (_log_z)
     # internally; MPS doesn't support float64, so cast to float32 before moving device.
@@ -404,6 +406,10 @@ def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=
         steps_per_epoch = len(train_dataloader)
         ramp_steps = max(1, int(es_term.get('rampup_epochs', 0) * steps_per_epoch))
         first_step = start_epoch * steps_per_epoch
+        es_cond_only = es_term.get('target', 'all') == 'conditioner'
+        cond_params = [p_ for n_, p_ in model.named_parameters() if n_.startswith('condition_net.') and p_.requires_grad]
+        if es_cond_only and not cond_params:
+            raise ValueError("es_phicp_target='conditioner' but the conditioner has no trainable parameters (frozen?)")
 
     def flow_es_loss(X, y, w, lam):
         return _compute_flow_loss_with_es(model, X, y, w, es_term['fn'], lam, es_term.get('fraction', 1.0))
@@ -413,7 +419,7 @@ def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=
     for epoch in range(start_epoch + 1, num_epochs + 1):
         model.train() # need to set model back to train mode, otherise dropout (and batchnorm if used) will not work
         running_loss=0
-        run_nll, run_es, n_es, n_es_fail = 0.0, 0.0, 0, 0
+        run_nll, run_es, n_es, n_es_fail, n_nonfinite = 0.0, 0.0, 0, 0, 0
         mlp_loss_fn = nn.MSELoss()
         for batch, batch_data in enumerate(train_dataloader):
             X, y, w = _unpack_batch(batch_data, device)
@@ -427,9 +433,24 @@ def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=
                     n_es_fail += 1
                 else:
                     run_es += es_b.item(); n_es += 1
+                if es_b is not None and es_cond_only:
+                    # ES gradient into the conditioner only; the flow's own parameters train on the NLL alone,
+                    # so the ES cannot buy a lower score by reshaping the density itself
+                    g_es = torch.autograd.grad(lam * es_b, cond_params, retain_graph=True, allow_unused=True)
+                    nll_b.backward()
+                    for p_, g_ in zip(cond_params, g_es):
+                        if g_ is not None:
+                            p_.grad = g_ if p_.grad is None else p_.grad + g_
+                else:
+                    loss.backward()
+                if not all(torch.isfinite(p_.grad).all() for p_ in model.parameters() if p_.grad is not None):
+                    # one non-finite gradient would turn every weight into NaN through the optimizer step
+                    n_nonfinite += 1
+                    optimizer.zero_grad()
+                    continue
             else:
                 loss = _compute_loss(model, X, y, w, useMLP, mlp_loss_fn)
-            loss.backward()
+                loss.backward()
             if clip_grad_norm:
                 # bounds the rare huge gradients from the spline tails that otherwise
                 # show up as one-epoch loss spikes; off unless hp['clip_grad_norm'] > 0
@@ -450,6 +471,8 @@ def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=
             train_nll, train_es = run_nll / len(train_dataloader), run_es / max(n_es, 1)
             if n_es_fail:
                 print(f'>> ES skipped on {n_es_fail} batches (nflows spline-inverse assertion on every retry)')
+            if n_nonfinite:
+                print(f'>> WARNING: {n_nonfinite} optimizer steps skipped because of a non-finite gradient')
 
         model.eval()
         if recompute_train_loss:

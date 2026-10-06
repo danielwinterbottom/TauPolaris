@@ -52,8 +52,17 @@ def _unit(v, eps=1e-12):
     return v / v.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
-def phicp_cos_sin(native, basis1, basis2):
+def phicp_cos_sin(native, basis1, basis2, perp_eps=0.0, min_one_minus_beta2=1e-12):
     """(cos phiCP, sin phiCP) from native onorm outputs.
+
+    perp_eps > 0 softens the two places where phiCP's gradient diverges, for use on flow SAMPLES
+    (keep the defaults for the truth, which then matches evaluate_polvec exactly):
+      * the transverse pol-vec is normalised as v / sqrt(|v|^2 + perp_eps^2) instead of v / |v|, so a
+        sample whose pol-vec is (nearly) parallel to the tau direction -- phiCP undefined, d phiCP / d h
+        ~ 1/|h_perp| -- moves towards the centre of the circle ("no information") with a gradient
+        bounded by ~1/perp_eps, and samples with |h_perp| >> perp_eps are essentially unchanged;
+      * 1 - beta^2 of the ditau boost is floored at min_one_minus_beta2 (gamma <= 1/sqrt of it), since
+        the boost's derivative grows like gamma^3.
 
     native : (..., 12) in onorm_output_order: ts_hh_t1_{n,r,k}, ts_hh_t2_{n,r,k},
              undecayed_t1_{n,r,k}, undecayed_t2_{n,r,k}   (physical units)
@@ -73,15 +82,20 @@ def phicp_cos_sin(native, basis1, basis2):
     # tau_directions_com: boost tau1 into the ditau rest frame (kinematic_helpers.boost with -beta)
     beta = (p_t1 + p_t2) / (E_t1 + E_t2)
     b2 = (beta ** 2).sum(-1, keepdim=True)
-    gamma = 1.0 / torch.sqrt((1.0 - b2).clamp_min(1e-12))
+    gamma = 1.0 / torch.sqrt((1.0 - b2).clamp_min(min_one_minus_beta2))
     bp = (beta * p_t1).sum(-1, keepdim=True)
     gamma2 = torch.where(b2 > 0, (gamma - 1.0) / b2.clamp_min(1e-30), torch.zeros_like(b2))
     p1_com = p_t1 + gamma2 * (-bp) * (-beta) + gamma * (-beta) * E_t1
     kx = _unit(p1_com)
     # phicp_from_cart's labelling: R1 = h_t2, P1 = -kx (tau2 direction); R2 = h_t1, P2 = kx
     R1, P1, R2, P2 = h_t2, -kx, h_t1, kx
-    u1 = _unit(R1 - (R1 * P1).sum(-1, keepdim=True) * P1)
-    u2 = _unit(R2 - (R2 * P2).sum(-1, keepdim=True) * P2)
+    v1 = R1 - (R1 * P1).sum(-1, keepdim=True) * P1
+    v2 = R2 - (R2 * P2).sum(-1, keepdim=True) * P2
+    if perp_eps > 0:
+        u1 = v1 / torch.sqrt((v1 ** 2).sum(-1, keepdim=True) + perp_eps ** 2)
+        u2 = v2 / torch.sqrt((v2 ** 2).sum(-1, keepdim=True) + perp_eps ** 2)
+    else:
+        u1, u2 = _unit(v1), _unit(v2)
     cos = (u1 * u2).sum(-1)
     sin = (P2 * torch.cross(u1, u2, dim=-1)).sum(-1)
     return cos, sin
@@ -107,7 +121,7 @@ class PhiCPEnergyScore:
     """
 
     def __init__(self, input_features, output_features, input_mean, input_std, output_mean, output_std,
-                 n_samples=2, tau_labels=('taup', 'taun')):
+                 n_samples=2, tau_labels=('taup', 'taun'), perp_eps=0.05, min_one_minus_beta2=1e-3):
         t1, t2 = tau_labels
         expected = [f'ts_hh_{t}_{c}' for t in (t1, t2) for c in 'nrk'] + \
                    [f'undecayed_{t}_{c}' for t in (t1, t2) for c in 'nrk']
@@ -125,6 +139,7 @@ class PhiCPEnergyScore:
         self.in_mean, self.in_std = input_mean.reshape(-1), input_std.reshape(-1)
         self.out_mean, self.out_std = output_mean.reshape(-1), output_std.reshape(-1)
         self.n_samples = n_samples
+        self.perp_eps, self.min_one_minus_beta2 = perp_eps, min_one_minus_beta2   # softening, samples only
 
     def bases(self, X):
         """Per-leg (n,r,k) bases from the standardised inputs X (B, n_in); no gradient."""
@@ -153,6 +168,6 @@ class PhiCPEnergyScore:
         samples = flow.sample(num_samples=self.n_samples, context=cond_embed)      # (B, m, 12), standardised
         nat = self.native(samples)
         bb1 = tuple(v[:, None, :] for v in b1); bb2 = tuple(v[:, None, :] for v in b2)
-        cs_s = torch.stack(phicp_cos_sin(nat, bb1, bb2), dim=-1)                   # (B, m, 2)
+        cs_s = torch.stack(phicp_cos_sin(nat, bb1, bb2, self.perp_eps, self.min_one_minus_beta2), dim=-1)  # (B, m, 2)
         cs_t = torch.stack(phicp_cos_sin(self.native(y_std), b1, b2), dim=-1)      # (B, 2)
         return energy_score_circle(cs_s, cs_t)
