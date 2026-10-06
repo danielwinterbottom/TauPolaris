@@ -69,12 +69,39 @@ if __name__ == "__main__":
                         frame_aligned_level=_resolve_frame_aligned_level(data_config),
                         condition_net_init=nn_config.get('condition_net_init'),
                         condition_net_freeze=bool(nn_config.get('condition_net_freeze', False)),
-                        context_hidden_layer=bool(nn_config.get('condition_net_hidden_layer', False)))
+                        context_hidden_layer=bool(nn_config.get('condition_net_hidden_layer', False)),
+                        init_from=nn_config.get('init_from'))
     print("Model and training setup complete.")
+
+    init_from = nn_config.get('init_from')
+    if init_from and not nn_config['reload']:
+        # the starting weights only make sense with the standardisation they were trained with
+        src_norm = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(init_from))), 'normalization_params.npz')
+        if os.path.exists(src_norm):
+            src = np.load(src_norm)
+            here = {'input_mean': in_mean, 'input_std': in_std, 'output_mean': out_mean, 'output_std': out_std}
+            worst = max(float(np.max(np.abs(np.asarray(here[k]) - src[k]) / (np.abs(src[k]) + 1e-6))) for k in here)
+            print(f">> init_from normalisation check vs {src_norm}: max relative difference {worst:.2e}")
+            if worst > 1e-4:
+                raise SystemExit('init_from: this run\'s input/output standardisation differs from the source model\'s -- '
+                                 'the starting weights would see shifted inputs/outputs. Use the same datasets and split.')
+        else:
+            print(f">> WARNING: no normalization_params.npz next to {init_from}; cannot check the standardisation matches")
+
+    # optional phiCP energy-score term (taupolaris/python/phicp_loss.py): loss = NLL + lambda * ES
+    es_term = None
+    if float(hp.get('es_phicp_lambda', 0) or 0) > 0:
+        from taupolaris.python.phicp_loss import PhiCPEnergyScore
+        es_term = dict(fn=PhiCPEnergyScore(input_features, output_features, in_mean, in_std, out_mean, out_std,
+                                           n_samples=int(hp.get('es_phicp_samples', 2))),
+                       lam=float(hp['es_phicp_lambda']), fraction=float(hp.get('es_phicp_fraction', 1.0)),
+                       rampup_epochs=float(hp.get('es_phicp_rampup_epochs', 0)))
+        print(f">> phiCP energy-score term ON: lambda {es_term['lam']}, {hp.get('es_phicp_samples', 2)} samples/event, "
+              f"fraction {es_term['fraction']}, ramp-up {es_term['rampup_epochs']} epochs")
 
     # Train — TransformerBaseline uses MSE loss, same as useMLP
     use_mse_loss = args.useMLP or args.useTransformerBaseline
-    best_val_loss, history = train_model(model, optimizer, train_loader, val_loader, num_epochs=nn_config['n_epochs'], device=device, verbose=True, output_plots_dir=output_plots_dir, save_every_N=1, scheduler=scheduler, early_stopper=es, useMLP=use_mse_loss, start_epoch=start_epoch, initial_history=initial_history, clip_grad_norm=hp.get('clip_grad_norm'))
+    best_val_loss, history = train_model(model, optimizer, train_loader, val_loader, num_epochs=nn_config['n_epochs'], device=device, verbose=True, output_plots_dir=output_plots_dir, save_every_N=1, scheduler=scheduler, early_stopper=es, useMLP=use_mse_loss, start_epoch=start_epoch, initial_history=initial_history, clip_grad_norm=hp.get('clip_grad_norm'), es_term=es_term)
 
     model_name = nn_config['model_name']
     torch.save(model.state_dict(), f'{output_dir}/{model_name}.pth')

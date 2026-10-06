@@ -39,6 +39,28 @@ def _compute_loss(model, X, y, w, useMLP, mlp_loss_fn):
         return mlp_loss_fn(predictions, y)
 
 
+def _compute_flow_loss_with_es(model, X, y, w, es_fn, lam, fraction=1.0, max_tries=3):
+    """NLL + lam * (phiCP energy score) for the flow, sharing one conditioner pass between the two.
+    The ES is evaluated on the first `fraction` of the batch (batches are shuffled, so this is a
+    random subset) and weighted like the NLL. Returns (total, nll, es); es is None when the rare
+    nflows spline-inverse assertion hits every retry, and the batch then trains on the NLL alone."""
+    emb = model.condition_net(X)
+    log_p = model.flow.log_prob(inputs=y, context=emb)
+    w_ = torch.ones_like(log_p) if w is None else w
+    nll = -(w_ * log_p).sum() / w_.sum()
+    n = max(2, int(round(fraction * len(X))))
+    for _ in range(max_tries):
+        try:
+            es_ev = es_fn.per_event(model.flow, emb[:n], X[:n], y[:n])
+            break
+        except AssertionError:
+            continue
+    else:
+        return nll, nll, None
+    es = (w_[:n] * es_ev).sum() / w_[:n].sum()
+    return nll + lam * es, nll, es
+
+
 def get_device():
     """Select the best available compute device: CUDA GPU, Apple Silicon GPU (MPS), or CPU."""
     if torch.cuda.is_available():
@@ -214,7 +236,10 @@ def init_condition_net_from(model, path, verbose=True):
 
 
 def setup_model_and_training(hp, train_dataset, test_dataset, input_features, output_features, model_name, verbose=True, reload=False, reload_scheduler=False, reset_training=False, batch_norm=False, useMLP=False, useTransformer=False, useTransformerMLP=False, leptonic_mode=0, polvec_feature_level=0, frame_aligned_level=0, condition_net_init=None, condition_net_freeze=False,
-                             context_hidden_layer=False):
+                             context_hidden_layer=False, init_from=None):
+    """init_from: path to a full state_dict (e.g. another run's best_model.pth) to start from -- for
+    fine-tuning. Unlike reload it starts a fresh optimizer, scheduler, epoch count and history,
+    and it takes precedence over condition_net_init (which only covers the conditioner)."""
     train_dataloader = DataLoader(train_dataset, batch_size=hp['batch_size'], shuffle=True)
     test_dataloader = DataLoader(test_dataset, batch_size=hp['batch_size'], shuffle=False)
 
@@ -262,6 +287,15 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
                                 num_layers=hp['num_layers'], num_bins=hp['num_bins'], tail_bound=hp['tail_bound'],
                                 hidden_size=hp['hidden_size'], num_blocks=hp['num_blocks'],
                                 batch_norm=batch_norm, activation=nn.LeakyReLU(0.05))
+
+    if init_from and not reload:
+        model.load_state_dict(torch.load(init_from, map_location='cpu'))
+        print(f">> All model weights initialised from {init_from} (fresh optimizer/scheduler/epochs)")
+        if condition_net_init:
+            print(">> condition_net_init ignored because init_from already sets every weight")
+            condition_net_init = None
+    elif init_from and reload:
+        print(">> init_from ignored because reload=True (resuming this run's own partial checkpoint)")
 
     if condition_net_init:
         if reload:
@@ -352,23 +386,49 @@ def setup_model_and_training(hp, train_dataset, test_dataset, input_features, ou
 
 def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=10, device="cpu", verbose=True, output_plots_dir=None,
     save_every_N=None, recompute_train_loss=True, scheduler=None, early_stopper=None, useMLP=False, optuna_trial=None,
-    start_epoch=0, initial_history=None, clip_grad_norm=None):
+    start_epoch=0, initial_history=None, clip_grad_norm=None, es_term=None):
+    """es_term: optional dict(fn=PhiCPEnergyScore, lam=float, fraction=float, rampup_epochs=int) adding
+    lam * (phiCP energy score) to the flow NLL (taupolaris/python/phicp_loss.py). During training lam
+    ramps linearly from 0 over the first rampup_epochs epochs of this run; validation always uses the
+    full lam, so val_loss (and the best-model choice) has one fixed definition. The NLL and ES parts
+    are also stored separately in history (train_nll/train_es/val_nll/val_es)."""
     # nflows' StandardNormal distribution registers a float64 buffer (_log_z)
     # internally; MPS doesn't support float64, so cast to float32 before moving device.
     model.float().to(device)
     history = initial_history if initial_history is not None else {"train_loss": [], "val_loss": []}
     best_val_loss = min(history["val_loss"]) if history["val_loss"] else float("inf")
+    use_es = es_term is not None and not useMLP
+    if use_es:
+        for k in ('train_nll', 'train_es', 'val_nll', 'val_es'):
+            history.setdefault(k, [])
+        steps_per_epoch = len(train_dataloader)
+        ramp_steps = max(1, int(es_term.get('rampup_epochs', 0) * steps_per_epoch))
+        first_step = start_epoch * steps_per_epoch
+
+    def flow_es_loss(X, y, w, lam):
+        return _compute_flow_loss_with_es(model, X, y, w, es_term['fn'], lam, es_term.get('fraction', 1.0))
 
     if early_stopper: early_stopper.reset()
 
     for epoch in range(start_epoch + 1, num_epochs + 1):
         model.train() # need to set model back to train mode, otherise dropout (and batchnorm if used) will not work
         running_loss=0
+        run_nll, run_es, n_es, n_es_fail = 0.0, 0.0, 0, 0
         mlp_loss_fn = nn.MSELoss()
         for batch, batch_data in enumerate(train_dataloader):
             X, y, w = _unpack_batch(batch_data, device)
             optimizer.zero_grad()
-            loss = _compute_loss(model, X, y, w, useMLP, mlp_loss_fn)
+            if use_es:
+                step = (epoch - 1) * steps_per_epoch + batch - first_step
+                lam = es_term['lam'] * min(1.0, (step + 1) / ramp_steps) if es_term.get('rampup_epochs', 0) > 0 else es_term['lam']
+                loss, nll_b, es_b = flow_es_loss(X, y, w, lam)
+                run_nll += nll_b.item()
+                if es_b is None:
+                    n_es_fail += 1
+                else:
+                    run_es += es_b.item(); n_es += 1
+            else:
+                loss = _compute_loss(model, X, y, w, useMLP, mlp_loss_fn)
             loss.backward()
             if clip_grad_norm:
                 # bounds the rare huge gradients from the spline tails that otherwise
@@ -386,32 +446,56 @@ def train_model(model, optimizer, train_dataloader, test_dataloader, num_epochs=
             running_loss += loss.item()
 
         train_loss = running_loss / len(train_dataloader)
+        if use_es:
+            train_nll, train_es = run_nll / len(train_dataloader), run_es / max(n_es, 1)
+            if n_es_fail:
+                print(f'>> ES skipped on {n_es_fail} batches (nflows spline-inverse assertion on every retry)')
 
         model.eval()
         if recompute_train_loss:
             # recompute train loss for better estimate, capped to same number of batches as validation
             n_batches = len(test_dataloader)
-            sum_train_loss = 0
+            sum_train_loss, sum_nll, sum_es, k_es = 0, 0.0, 0.0, 0
             with torch.no_grad():
                 for i, batch_data in enumerate(train_dataloader):
                     if i >= n_batches:
                         break
                     X_train, y_train, w_train = _unpack_batch(batch_data, device)
-                    train_loss = _compute_loss(model, X_train, y_train, w_train, useMLP, mlp_loss_fn)
+                    if use_es:
+                        train_loss, nll_b, es_b = flow_es_loss(X_train, y_train, w_train, es_term['lam'])
+                        sum_nll += nll_b.item()
+                        if es_b is not None:
+                            sum_es += es_b.item(); k_es += 1
+                    else:
+                        train_loss = _compute_loss(model, X_train, y_train, w_train, useMLP, mlp_loss_fn)
                     sum_train_loss += train_loss.item()
             train_loss = sum_train_loss / n_batches
+            if use_es:
+                train_nll, train_es = sum_nll / n_batches, sum_es / max(k_es, 1)
 
         history["train_loss"].append(train_loss)
 
         # validation phase
-        val_running_loss = 0
+        val_running_loss, val_nll, val_es, k_es = 0, 0.0, 0.0, 0
         with torch.no_grad():
             for batch_data in test_dataloader:
                 X_val, y_val, w_val = _unpack_batch(batch_data, device)
-                val_loss = _compute_loss(model, X_val, y_val, w_val, useMLP, mlp_loss_fn)
+                if use_es:
+                    val_loss, nll_b, es_b = flow_es_loss(X_val, y_val, w_val, es_term['lam'])
+                    val_nll += nll_b.item()
+                    if es_b is not None:
+                        val_es += es_b.item(); k_es += 1
+                else:
+                    val_loss = _compute_loss(model, X_val, y_val, w_val, useMLP, mlp_loss_fn)
                 val_running_loss += val_loss.item()
         val_loss = val_running_loss / len(test_dataloader)
         history["val_loss"].append(val_loss)
+        if use_es:
+            val_nll, val_es = val_nll / len(test_dataloader), val_es / max(k_es, 1)
+            for k, v in (('train_nll', train_nll), ('train_es', train_es), ('val_nll', val_nll), ('val_es', val_es)):
+                history[k].append(v)
+            print(f'Epoch {epoch} | NLL train {train_nll:.4f} val {val_nll:.4f} | phiCP ES train {train_es:.5f} val {val_es:.5f} '
+                  f'| lambda {es_term["lam"]:.4g}')
 
         if optuna_trial is not None and ((epoch == 10) or (epoch == 15)):
             import optuna
