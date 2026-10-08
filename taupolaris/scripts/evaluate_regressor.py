@@ -291,9 +291,15 @@ def main():
             pred_cart = pd.DataFrame(np.concatenate([unit(pred_h[t1]), unit(pred_h[t2]), pred_tau[t1], pred_tau[t2]], axis=1), columns=true_cart.columns)
             variants['phiCP'] = phicp_from_cart(pred_cart, E_t[t1], E_t[t2], tau_labels)
         if pred_nu:
-            phi_nuvis, _, _ = phicp_from_regressed_taus(df, tau_from_nu[t1], tau_from_nu[t2], E_from_nu[t1], E_from_nu[t2],
-                                                        dm[t1], dm[t2], tau_labels)
-            variants['phiCP_nuvis'] = phi_nuvis
+            # in chunks: get_ditau_polarimetric builds many awkward/float64 temporaries per event, which for
+            # the 6.5M-event all-channel sample alone pushed the login node past its ~16 GB limit
+            # (per-event, so chunking does not change the result)
+            chunk = 500_000
+            variants['phiCP_nuvis'] = np.concatenate([
+                phicp_from_regressed_taus(df.iloc[s:s + chunk], tau_from_nu[t1][s:s + chunk], tau_from_nu[t2][s:s + chunk],
+                                          E_from_nu[t1][s:s + chunk], E_from_nu[t2][s:s + chunk],
+                                          dm[t1][s:s + chunk], dm[t2][s:s + chunk], tau_labels)[0]
+                for s in range(0, len(df), chunk)])
         dm_pairs = [[100, 0], [100, 1], [100, 2], [100, 10], [100, 11], [100, 100],
                     [0, 0], [0, 1], [1, 1], [2, 2], [1, 2], [0, 2], [10, 10], [0, 10], [1, 10], [2, 10],
                     [0, 11], [1, 11], [2, 11], [10, 11], [11, 11]]
