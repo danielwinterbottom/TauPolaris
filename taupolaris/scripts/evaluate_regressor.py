@@ -67,14 +67,15 @@ def mass(E, p):
     return np.sqrt(np.clip(E ** 2 - np.sum(p ** 2, axis=1), 0, None))
 
 
-def load_test_float32(path, data_config, norm_data, output_features, columns, max_events=0, block=500_000):
+def load_test_float32(path, data_config, norm_data, output_features, columns, max_events=0, keep=None, block=500_000):
     """Memory-bounded replacement for get_test_dataset: streams the test parquet in blocks, keeping
     floating-point columns as float32 (pandas would otherwise hold float64 -- the 6.5M-event
     all-channel test file then needs ~10 GB for the frame alone, past the login node's ~16 GB with the
     tensors on top), and stops after max_events (> 0) rows instead of reading everything first.
     The model inputs were float32 in get_test_dataset too, and standardisation is the same
     RegressionDataset code, so the predictions are unchanged; only truth columns lose float64 precision
-    (~1e-7 relative)."""
+    (~1e-7 relative). keep: if given, the returned frame is cut to these columns once the input tensor
+    is built (input-only columns are not needed afterwards and are ~half the frame)."""
     input_features = list(data_config['Features']['input_features'])
     if data_config.get('inc_reco_taus'):
         input_features += data_config['Features']['input_reco_tau_features']
@@ -97,6 +98,8 @@ def load_test_float32(path, data_config, norm_data, output_features, columns, ma
                                 input_mean=torch.from_numpy(norm_data['input_mean']), input_std=torch.from_numpy(norm_data['input_std']),
                                 output_mean=torch.from_numpy(norm_data['output_mean']), output_std=torch.from_numpy(norm_data['output_std']),
                                 X=X, y=y)
+    if keep is not None:
+        df = df[[c for c in df.columns if c in keep]]
     return dataset, df
 
 
@@ -145,7 +148,7 @@ def main():
         print(f'>> evaluating {test_path}')
         data_config['test_dataset'] = test_path
         available = pq.ParquetFile(test_path).schema_arrow.names
-        wanted = set(data_config['Features']['input_features']) | set(output_features)
+        wanted = set(output_features)
         for t in tau_labels:
             wanted |= {f'reco_{t}_{part}_{c}' for part in ('charged', 'pizero1') for c in ('px', 'py', 'pz', 'e')}
             wanted |= {f'undecayed_{t}_{c}' for c in ('px', 'py', 'pz', 'e')}
@@ -155,8 +158,10 @@ def main():
                 wanted |= {f'{pre}{t}_{f}' for f in ('ishadronic', 'npizero', 'is3prong')}
         wanted |= {'tauspinner_wt_alpha0', 'tauspinner_wt_alpha45', 'tauspinner_wt_alpha90'}
         wanted |= columns_for_regressed_tau_phicp(tau_labels)   # reco pion four-vectors for the nu + visible -> analytic h route
+        keep = set(wanted)                                     # everything used after the prediction
+        wanted |= set(data_config['Features']['input_features'])
         dataset, df = load_test_float32(test_path, data_config, norm_data, output_features,
-                                        sorted(wanted & set(available)), args.max_events)
+                                        sorted(wanted & set(available)), args.max_events, keep=keep)
         n = len(df)
         X, _ = dataset[:]
         X = X[:n]
@@ -165,6 +170,7 @@ def main():
             for s in range(0, n, args.batch_size):
                 preds.append(model(X[s:s + args.batch_size].to(device)).cpu())
         native = pd.DataFrame(dataset.destandardize_outputs(torch.cat(preds)).numpy(), columns=output_features)
+        del X, preds, dataset                                  # the input tensor is the largest object left
         outdir = os.path.join(output_dir, 'plots_eval_regressor', test_name + (f'_{args.tag}' if args.tag else ''))
         os.makedirs(outdir, exist_ok=True)
 
