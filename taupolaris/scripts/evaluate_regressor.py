@@ -28,7 +28,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.getcwd())
-from taupolaris.python.DataProcessing import get_test_dataset, _resolve_polvec_feature_level, _resolve_frame_aligned_level
+from taupolaris.python.DataProcessing import RegressionDataset, _resolve_polvec_feature_level, _resolve_frame_aligned_level
 from taupolaris.python.NN_Tools import load_model, get_device
 from taupolaris.utils.coordinate_conversions import ConvertFromOrthonormalNRK_Predictions_PolVec
 from taupolaris.scripts.evaluate_polvec import (add_DM, phicp_from_cart, normalised_phicp_counts, plot_true_vs_pred_2d,
@@ -65,6 +65,39 @@ def iqr(x):
 
 def mass(E, p):
     return np.sqrt(np.clip(E ** 2 - np.sum(p ** 2, axis=1), 0, None))
+
+
+def load_test_float32(path, data_config, norm_data, output_features, columns, max_events=0, block=500_000):
+    """Memory-bounded replacement for get_test_dataset: streams the test parquet in blocks, keeping
+    floating-point columns as float32 (pandas would otherwise hold float64 -- the 6.5M-event
+    all-channel test file then needs ~10 GB for the frame alone, past the login node's ~16 GB with the
+    tensors on top), and stops after max_events (> 0) rows instead of reading everything first.
+    The model inputs were float32 in get_test_dataset too, and standardisation is the same
+    RegressionDataset code, so the predictions are unchanged; only truth columns lose float64 precision
+    (~1e-7 relative)."""
+    input_features = list(data_config['Features']['input_features'])
+    if data_config.get('inc_reco_taus'):
+        input_features += data_config['Features']['input_reco_tau_features']
+    parts, n = [], 0
+    for b in pq.ParquetFile(path).iter_batches(batch_size=block, columns=columns):
+        part = b.to_pandas()
+        f64 = part.select_dtypes('float64').columns
+        part[f64] = part[f64].astype(np.float32)
+        if max_events > 0 and n + len(part) > max_events:
+            part = part.iloc[:max_events - n]
+        parts.append(part); n += len(part)
+        if max_events > 0 and n >= max_events:
+            break
+    df = pd.concat(parts, ignore_index=True); del parts
+    print(f'>> Number of events in test dataframe: {len(df)} (float32 columns)')
+    print(f'>> Number of input features: {len(input_features)}')
+    X = torch.from_numpy(df[input_features].to_numpy(dtype=np.float32))
+    y = torch.from_numpy(df[output_features].to_numpy(dtype=np.float32))
+    dataset = RegressionDataset(None, input_features, output_features, normalize_inputs=True, normalize_outputs=True,
+                                input_mean=torch.from_numpy(norm_data['input_mean']), input_std=torch.from_numpy(norm_data['input_std']),
+                                output_mean=torch.from_numpy(norm_data['output_mean']), output_std=torch.from_numpy(norm_data['output_std']),
+                                X=X, y=y)
+    return dataset, df
 
 
 def main():
@@ -122,9 +155,8 @@ def main():
                 wanted |= {f'{pre}{t}_{f}' for f in ('ishadronic', 'npizero', 'is3prong')}
         wanted |= {'tauspinner_wt_alpha0', 'tauspinner_wt_alpha45', 'tauspinner_wt_alpha90'}
         wanted |= columns_for_regressed_tau_phicp(tau_labels)   # reco pion four-vectors for the nu + visible -> analytic h route
-        dataset, df, _, _ = get_test_dataset(data_config, norm_data, columns=sorted(wanted & set(available)))
-        if args.max_events > 0 and len(df) > args.max_events:
-            df = df.iloc[:args.max_events].reset_index(drop=True)
+        dataset, df = load_test_float32(test_path, data_config, norm_data, output_features,
+                                        sorted(wanted & set(available)), args.max_events)
         n = len(df)
         X, _ = dataset[:]
         X = X[:n]
