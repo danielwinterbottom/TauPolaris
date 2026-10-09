@@ -17,6 +17,7 @@ histograms) and with the old method via the published nu-method +18%.
     python weighted_significance/uncertainty_cut_scan.py \\
         --results <evaluate_polvec results parquet> [--label Sep01] \\
         [--phi_column pred_phiCP --err_column pred_phiCP_err] [--lep asymmetry_lep_Polaris.yaml]
+        [--bkg_results <same model evaluated on Z->tautau>]   (adds the fs/sqrt(fb) version)
 """
 import argparse
 import glob
@@ -44,6 +45,65 @@ def run3_asymmetries():
     return out
 
 
+def background_scan(args, chans, per_chan, fracs, cuts, N_had, N_lep, S2_lep, S_old, err_sig, outdir):
+    """Same cut thresholds, but with the sensitivity scaling as S/sqrt(B) instead of sqrt(S): per channel the
+    cut keeps a signal fraction fs and a background fraction fb (from the model evaluated on a background
+    sample, e.g. Z->tautau, same channel and same threshold), and a channel's contribution changes from
+    N a^2 fs (the sqrt(f) assumption above) to N a^2 fs^2 / fb. The uncut background in each channel is
+    taken proportional to its signal (only the CHANGE from the cut comes from the background sample), so
+    with no cut this equals the signal-only number."""
+    b = pd.read_parquet(args.bkg_results, columns=[args.err_column, 'reco_taup_DM', 'reco_taun_DM'])
+    err_b = b[args.err_column].to_numpy(float); err_b = np.where(np.isfinite(err_b), err_b, np.inf)
+    bp, bn = b['reco_taup_DM'].to_numpy(), b['reco_taun_DM'].to_numpy()
+    bmask = {k: (bp == int(k.split('DM')[1])) & (bn == int(k.split('DM')[2])) for k in chans}
+    had_b = np.zeros(len(b), bool)
+    for m in bmask.values():
+        had_b |= m
+    sig_h = np.concatenate([err_sig[m] for m in chans.values()])
+    print(f'\n>> background {args.bkg_results}: {len(b)} events, {had_b.sum()} in the hadronic channels; '
+          f'median phiCP uncertainty: background {np.median(err_b[had_b]):.3f} rad, signal {np.median(sig_h):.3f} rad')
+    rows, per = [], {}
+    for f, X in zip(fracs, cuts):
+        S2_sf = S2_bk = 0.0
+        for k, m in chans.items():
+            n0, _ = per_chan[k][1.0]; n, a = per_chan[k][f]
+            fs = n / n0
+            nb0 = int(bmask[k].sum())
+            fb = max((err_b[bmask[k]] <= X).sum(), 1) / max(nb0, 1)      # floor at one event: no division by zero
+            S2_sf += n0 * a ** 2 * fs
+            S2_bk += n0 * a ** 2 * fs ** 2 / fb if nb0 > 0 else n0 * a ** 2 * fs
+            per.setdefault(k, {})[f] = (fs, fb, nb0)
+        rows.append({'pass fraction': f, 'cut X [rad]': X, 'bkg pass': float((err_b[had_b] <= X).mean()),
+                     'S sqrt(f)': np.sqrt((S2_sf + S2_lep) / (N_had + N_lep)),
+                     'S fs/sqrt(fb)': np.sqrt((S2_bk + S2_lep) / (N_had + N_lep))})
+    t = pd.DataFrame(rows)
+    for c in ('S sqrt(f)', 'S fs/sqrt(fb)'):
+        t[c + ' vs no cut'] = t[c] / t.loc[t['pass fraction'] == 1.0, c].iloc[0] - 1
+        t[c + ' vs old'] = t[c] / S_old - 1
+    fmt = {'pass fraction': '{:.2f}'.format, 'cut X [rad]': '{:.3f}'.format, 'bkg pass': '{:.3f}'.format,
+           'S sqrt(f)': '{:.4f}'.format, 'S fs/sqrt(fb)': '{:.4f}'.format}
+    fmt.update({c: '{:+.1%}'.format for c in t.columns if c.endswith('no cut') or c.endswith('old')})
+    print('=== same scan, sensitivity as S/sqrt(B): signal-only sqrt(f) vs background-aware fs/sqrt(fb) ===')
+    print(t.to_string(index=False, formatters=fmt))
+    for c in ('S sqrt(f)', 'S fs/sqrt(fb)'):
+        best = t.loc[t[c].idxmax()]
+        print(f">> optimum with {c:14s}: pass fraction {best['pass fraction']:.2f} (background kept {best['bkg pass']:.3f}): "
+              f"{best[c + ' vs no cut']:+.1%} vs no cut, {best[c + ' vs old']:+.1%} vs old method")
+    fbest = t.loc[t['S fs/sqrt(fb)'].idxmax(), 'pass fraction']
+    print(f'\n=== per channel at the background-aware optimum (signal pass fraction {fbest:.2f}) ===')
+    crow = []
+    for k in chans:
+        fs, fb, nb0 = per[k][fbest]; n0, a0 = per_chan[k][1.0]; _, a = per_chan[k][fbest]
+        crow.append({'channel': k, 'N sig': n0, 'N bkg': nb0, 'fs': fs, 'fb': fb, 'fs/sqrt(fb)': fs / np.sqrt(fb),
+                     'asym ratio': a / a0 if a0 > 0 else np.nan,
+                     'gain sqrt(f)': a / a0 * np.sqrt(fs) - 1 if a0 > 0 else np.nan,
+                     'gain fs/sqrt(fb)': a / a0 * fs / np.sqrt(fb) - 1 if a0 > 0 else np.nan})
+    c = pd.DataFrame(crow)
+    print(c.to_string(index=False, float_format=lambda v: f'{v:.3f}'))
+    t.to_csv(os.path.join(outdir, 'scan_with_background.csv'), index=False)
+    c.to_csv(os.path.join(outdir, f'per_channel_background_f{fbest:.2f}.csv'), index=False)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--results', required=True)
@@ -55,6 +115,9 @@ def main():
                     help='nu-method hadronic yaml; with --lep it defines the +18%% reference')
     ap.add_argument('--fractions', default='1.0,0.95,0.9,0.85,0.8,0.75,0.7,0.65,0.6,0.55,0.5,0.45,0.4,0.35,0.3,0.25,0.2')
     ap.add_argument('--outdir', default=None)
+    ap.add_argument('--bkg_results', default=None,
+                    help='the same model evaluated on a background sample (e.g. Z->tautau): adds the scan with the '
+                         'sensitivity scaling as fs/sqrt(fb) instead of sqrt(f) -- see background_scan')
     args = ap.parse_args()
     label = args.label or os.path.basename(os.path.dirname(os.path.abspath(args.results)))
     outdir = args.outdir or os.path.join(HERE, f'uncertainty_cut_{label}')
@@ -113,6 +176,9 @@ def main():
           f"S = {best['S had+lep']:.4f}, {best['vs no cut']:+.1%} vs no cut, {best['vs old method']:+.1%} vs old method "
           f"(nu-method reference {S_ref:.4f} = +18.0%)")
     scan.to_csv(os.path.join(outdir, 'scan.csv'), index=False)
+
+    if args.bkg_results:
+        background_scan(args, chans, per_chan, fracs, cuts, N_had, N_lep, S2_lep, S_old, err, outdir)
 
     # per-channel view at the optimum vs run-3 and vs no cut
     fb = best['pass fraction']; run3 = run3_asymmetries()
