@@ -18,6 +18,7 @@ histograms) and with the old method via the published nu-method +18%.
         --results <evaluate_polvec results parquet> [--label Sep01] \\
         [--phi_column pred_phiCP --err_column pred_phiCP_err] [--lep asymmetry_lep_Polaris.yaml]
         [--bkg_results <same model evaluated on Z->tautau>]   (adds the fs/sqrt(fb) version)
+        [--mvis_match <signal test parquet> <background test parquet>]   (background reweighted to the signal visible mass)
 """
 import argparse
 import glob
@@ -45,13 +46,27 @@ def run3_asymmetries():
     return out
 
 
+def visible_mass(path):
+    cols = [f'reco_{t}_{o}_{c}' for t in ('taup', 'taun') for o in ('charged', 'pizero1') for c in ('e', 'px', 'py', 'pz')]
+    import pyarrow.parquet as pq
+    d = pq.read_table(path, columns=cols).to_pandas()
+    E = sum(d[f'reco_{t}_{o}_e'] for t in ('taup', 'taun') for o in ('charged', 'pizero1'))
+    p = [sum(d[f'reco_{t}_{o}_p{c}'] for t in ('taup', 'taun') for o in ('charged', 'pizero1')) for c in 'xyz']
+    return np.sqrt(np.clip(E ** 2 - p[0] ** 2 - p[1] ** 2 - p[2] ** 2, 0, None)).to_numpy()
+
+
 def background_scan(args, chans, per_chan, fracs, cuts, N_had, N_lep, S2_lep, S_old, err_sig, outdir):
     """Same cut thresholds, but with the sensitivity scaling as S/sqrt(B) instead of sqrt(S): per channel the
     cut keeps a signal fraction fs and a background fraction fb (from the model evaluated on a background
     sample, e.g. Z->tautau, same channel and same threshold), and a channel's contribution changes from
     N a^2 fs (the sqrt(f) assumption above) to N a^2 fs^2 / fb. The uncut background in each channel is
     taken proportional to its signal (only the CHANGE from the cut comes from the background sample), so
-    with no cut this equals the signal-only number."""
+    with no cut this equals the signal-only number.
+
+    With --mvis_match SIG_TEST BKG_TEST each background event is weighted, channel by channel, so that the
+    background's visible-mass distribution (reco visible decay products, untouched by the model) matches the
+    signal's in that channel; fb is then a weighted fraction. This removes the part of the signal/background
+    separation that is only the mass difference, which an m_tautau fit provides anyway."""
     b = pd.read_parquet(args.bkg_results, columns=[args.err_column, 'reco_taup_DM', 'reco_taun_DM'])
     err_b = b[args.err_column].to_numpy(float); err_b = np.where(np.isfinite(err_b), err_b, np.inf)
     bp, bn = b['reco_taup_DM'].to_numpy(), b['reco_taun_DM'].to_numpy()
@@ -60,20 +75,34 @@ def background_scan(args, chans, per_chan, fracs, cuts, N_had, N_lep, S2_lep, S_
     for m in bmask.values():
         had_b |= m
     sig_h = np.concatenate([err_sig[m] for m in chans.values()])
+    wb = np.ones(len(b))
+    if args.mvis_match:
+        ms, mb = visible_mass(args.mvis_match[0]), visible_mass(args.mvis_match[1])
+        assert len(ms) == len(err_sig) and len(mb) == len(b), '--mvis_match test files are not row-aligned with the results'
+        edges = np.arange(0, 304, 4.0)
+        for k, m in chans.items():
+            hs, _ = np.histogram(ms[m], edges, density=True); hb, _ = np.histogram(mb[bmask[k]], edges, density=True)
+            ratio = np.where(hb > 0, hs / np.where(hb > 0, hb, 1), 0.0)
+            wb[bmask[k]] = ratio[np.clip(np.digitize(mb[bmask[k]], edges) - 1, 0, len(ratio) - 1)] * (mb[bmask[k]] < edges[-1])
+        neff = {k: wb[bmask[k]].sum() ** 2 / max((wb[bmask[k]] ** 2).sum(), 1e-12) for k in chans}
+        print(f'>> background reweighted per channel to the signal visible mass; effective background events per channel: '
+              f'min {min(neff.values()):.0f}, median {np.median(list(neff.values())):.0f}')
+    wmed = lambda x, w: x[np.argsort(x)][np.searchsorted(np.cumsum(w[np.argsort(x)]), w.sum() / 2)]
     print(f'\n>> background {args.bkg_results}: {len(b)} events, {had_b.sum()} in the hadronic channels; '
-          f'median phiCP uncertainty: background {np.median(err_b[had_b]):.3f} rad, signal {np.median(sig_h):.3f} rad')
+          f'median phiCP uncertainty: background {wmed(err_b[had_b], wb[had_b]):.3f} rad, signal {np.median(sig_h):.3f} rad')
     rows, per = [], {}
     for f, X in zip(fracs, cuts):
         S2_sf = S2_bk = 0.0
         for k, m in chans.items():
             n0, _ = per_chan[k][1.0]; n, a = per_chan[k][f]
             fs = n / n0
-            nb0 = int(bmask[k].sum())
-            fb = max((err_b[bmask[k]] <= X).sum(), 1) / max(nb0, 1)      # floor at one event: no division by zero
+            nb0 = int(bmask[k].sum()); wk = wb[bmask[k]]
+            wpass = wk[err_b[bmask[k]] <= X].sum()
+            fb = max(wpass, wk.max(initial=1.0)) / max(wk.sum(), 1e-12)   # floor at one (weighted) event: no division by zero
             S2_sf += n0 * a ** 2 * fs
             S2_bk += n0 * a ** 2 * fs ** 2 / fb if nb0 > 0 else n0 * a ** 2 * fs
             per.setdefault(k, {})[f] = (fs, fb, nb0)
-        rows.append({'pass fraction': f, 'cut X [rad]': X, 'bkg pass': float((err_b[had_b] <= X).mean()),
+        rows.append({'pass fraction': f, 'cut X [rad]': X, 'bkg pass': float(wb[had_b & (err_b <= X)].sum() / wb[had_b].sum()),
                      'S sqrt(f)': np.sqrt((S2_sf + S2_lep) / (N_had + N_lep)),
                      'S fs/sqrt(fb)': np.sqrt((S2_bk + S2_lep) / (N_had + N_lep))})
     t = pd.DataFrame(rows)
@@ -115,6 +144,9 @@ def main():
                     help='nu-method hadronic yaml; with --lep it defines the +18%% reference')
     ap.add_argument('--fractions', default='1.0,0.95,0.9,0.85,0.8,0.75,0.7,0.65,0.6,0.55,0.5,0.45,0.4,0.35,0.3,0.25,0.2')
     ap.add_argument('--outdir', default=None)
+    ap.add_argument('--mvis_match', nargs=2, default=None, metavar=('SIG_TEST', 'BKG_TEST'),
+                    help='with --bkg_results: reweight the background per channel to the signal visible mass, from these '
+                         'test files (row-aligned with --results and --bkg_results)')
     ap.add_argument('--bkg_results', default=None,
                     help='the same model evaluated on a background sample (e.g. Z->tautau): adds the scan with the '
                          'sensitivity scaling as fs/sqrt(fb) instead of sqrt(f) -- see background_scan')
