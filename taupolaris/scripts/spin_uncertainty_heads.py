@@ -8,9 +8,12 @@ true taus and polarimetric vectors:
     cos_i(+) * cos_j(-) for i, j = n, r, k        (9, the C matrix)
     and phiCP.
 
-Option 1 ('cov')  a head predicts a full 12x12 covariance (Cholesky factor, standardised output space) of the
-                  pol-vec and tau-momentum outputs around the regressor's prediction; multivariate Gaussian NLL.
-                  Any observable's uncertainty then follows by sampling N(mu, Sigma) and recomputing it (32 samples).
+Option 1 ('cov')  a head predicts a full 12x12 scale matrix (Cholesky factor, standardised output space) of the
+                  pol-vec and tau-momentum outputs around the regressor's prediction, with a multivariate Student-t
+                  likelihood (NU_T degrees of freedom). A Gaussian failed: the tau-momentum components transverse to the
+                  visible tau have rare residuals of 40-160 standard deviations, which a Gaussian penalises
+                  quadratically -- the validation NLL was in the thousands and erratic. Any observable's
+                  uncertainty then follows by sampling the t distribution and recomputing it (32 samples).
 Option 2 ('obs')  a head predicts one log sigma per observable (15), independent Gaussian NLLs on the observable
                   residuals (true - predicted). No correlations: one uncertainty, and one cut, per observable.
 Reference ('phicp') the phiCP von Mises head's uncertainty, used as a single cut for every observable.
@@ -126,6 +129,7 @@ class Head(nn.Module):
 
 
 TRIL = torch.tril_indices(NOUT, NOUT)
+NU_T = 4.0                                                                         # Student-t degrees of freedom (option 1)
 
 
 def chol(raw):
@@ -133,15 +137,16 @@ def chol(raw):
     L = torch.zeros(raw.shape[0], NOUT, NOUT, dtype=raw.dtype)
     L[:, TRIL[0], TRIL[1]] = raw
     d = torch.arange(NOUT)
-    L[:, d, d] = torch.exp(L[:, d, d].clamp(-7, 4))
+    L[:, d, d] = torch.exp(L[:, d, d].clamp(-5, 4))
     return L
 
 
 def nll_cov(raw, r):
-    """multivariate Gaussian NLL (up to a constant) with Sigma = L L^T; r = y - mu (B,12)."""
+    """multivariate Student-t NLL (up to a constant) with scale matrix L L^T and NU_T degrees of freedom;
+    r = y - mu (B,12). Outliers cost ~log(z^2), not z^2."""
     L = chol(raw)
     z = torch.linalg.solve_triangular(L, r.unsqueeze(-1), upper=False).squeeze(-1)
-    return 0.5 * (z ** 2).sum(1) + torch.log(torch.diagonal(L, dim1=1, dim2=2)).sum(1)
+    return 0.5 * (NU_T + NOUT) * torch.log1p((z ** 2).sum(1) / NU_T) + torch.log(torch.diagonal(L, dim1=1, dim2=2)).sum(1)
 
 
 def nll_obs(logsig, r):
@@ -224,7 +229,7 @@ def apply(args, cfg):
         e = min(s + args.apply_chunk, len(X))
         with torch.no_grad():
             L = chol(h((X[s:e] - ck['mu']) / ck['sd'])).numpy().astype(float)
-        z = rng.standard_normal((e - s, args.n_samples, NOUT))
+        z = rng.standard_normal((e - s, args.n_samples, NOUT)) * np.sqrt(NU_T / rng.chisquare(NU_T, (e - s, args.n_samples, 1)))  # Student-t
         smp = f['pred'][s:e, idx][:, None, :].astype(float) + np.einsum('bij,bkj->bki', L, z)        # (C, K, 12) standardised
         nat = (smp * osd + om).reshape(-1, NOUT)
         vis = np.repeat(f['vis'][s:e].astype(float), args.n_samples, axis=0)
