@@ -29,15 +29,29 @@ sig_fit_color = '#e42536'   # Best-fit signal                    (== pred_color)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=int, help="Determines which model to assume for the signal. 1 = CP-even Higgs, 2 = spin0 no entanglement, 3 = uncorrelated", default=1)
-parser.add_argument("--sig-file", default="outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet", help="Sig file for the fully-hadronic (tt) channel.")
-parser.add_argument("--bkg-file", default="outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_Z.parquet", help="Bkg file for the fully-hadronic (tt) channel.")
-parser.add_argument("--sig-file-sl", default='outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_results.parquet', help="Sig file for the semileptonic (mt+et) channels -- mu+tauh and e+tauh both come from the same file, distinguished by reco_taup/taun_ismuon/iselectron. If not provided (together with --bkg-file-sl), mt/et categories are skipped.")
-parser.add_argument("--bkg-file-sl", default='outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_Z.parquet', help="Bkg file for the semileptonic (mt+et) channels.")
+parser.add_argument("--sig-file", default="../DiTauEntanglement/outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet", help="Sig file for the fully-hadronic (tt) channel.")
+parser.add_argument("--bkg-file", default="../DiTauEntanglement/outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_Z.parquet", help="Bkg file for the fully-hadronic (tt) channel.")
+parser.add_argument("--sig-file-sl", default='../DiTauEntanglement/outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_results.parquet', help="Sig file for the semileptonic (mt+et) channels -- mu+tauh and e+tauh both come from the same file, distinguished by reco_taup/taun_ismuon/iselectron. If not provided (together with --bkg-file-sl), mt/et categories are skipped.")
+parser.add_argument("--bkg-file-sl", default='../DiTauEntanglement/outputs_Flow_Uncorr_Masked_Semileptonic_100e_July28/output_Z.parquet', help="Bkg file for the semileptonic (mt+et) channels.")
 parser.add_argument("--no-replace", action="store_true", help="Sample toys without replacement (non-overlapping chunks). Limits N_toys to the smallest category's pool_size/N_events.")
 parser.add_argument("--n-toys", type=int, default=1000, help="Number of toys to generate. If --no-replace is set, this will be limited by the smallest category's pool.")
 parser.add_argument("--outdir", default="nll_fits_aug7", help="Directory to write output files to.")
 parser.add_argument("--measure-B", action="store_true", help="Also measure B vector (tau polarization) elements.")
+parser.add_argument("--gen-taus", action="store_true",
+                    help="Build the (n, r, k) basis from the GENERATOR-level taus (true_tau_plus/minus_*) instead of the "
+                         "reconstructed ones -- separates the effect of the reconstructed basis direction (k = tau+ "
+                         "direction in the ditau rest frame) on the measured C_ij. Applied to signal and background.")
+parser.add_argument("--gen-polvecs", action="store_true",
+                    help="Use the GENERATOR-level polarimetric vectors (ts_hh_* from --sig-test-file/--bkg-test-file, "
+                         "which the wt_hp_*_hm_* spin weights follow) instead of the reconstructed ones. With --gen-taus "
+                         "this is the all-generator-level reference.")
+parser.add_argument("--sig-test-file", default="prepared_LHC_data_sep01/ppToHToTauTau_AllDM_UnCorr_Jul20/test_dataframe__leptonic_mode_0_transformer.parquet",
+                    help="Prepared test dataframe row-aligned with --sig-file (source of the generator-level polarimetric vectors for --gen-polvecs).")
+parser.add_argument("--bkg-test-file", default="prepared_LHC_data_oct04/ppToZToTauTau_AllDM_Jul20/test_dataframe_onorm_leptonic_mode_0_transformer.parquet",
+                    help="Prepared test dataframe row-aligned with --bkg-file (for --gen-polvecs).")
 args = parser.parse_args()
+print(f">> spin basis from {'GENERATOR' if args.gen_taus else 'reconstructed'} taus, polarimetric vectors "
+      f"{'GENERATOR' if args.gen_polvecs else 'reconstructed'}")
 
 os.makedirs(args.outdir, exist_ok=True)
 
@@ -376,7 +390,7 @@ def _swap_to_physical_charge(df, var_prefix):
     return df
 
 
-def _load_one(path, var_prefix, extra_cols):
+def _load_one(path, var_prefix, extra_cols, test_file=None):
     """Load a single parquet file, returning the cos{n,r,k}_{plus,minus}
     columns (for var_prefix) plus extra_cols.
 
@@ -402,8 +416,10 @@ def _load_one(path, var_prefix, extra_cols):
         [f'reco_{tau}_ishadronic' for tau in ('taup', 'taun')] +
         [f'reco_{tau}_is3prong' for tau in ('taup', 'taun')]
     )
+    gen_any = args.gen_taus or args.gen_polvecs
+    true_tau_cols = [f'true_tau_{s}_{c}' for s in ('plus', 'minus') for c in ('E', 'px', 'py', 'pz')]
     if all(c in avail for c in raw_needed):
-        needed = list(dict.fromkeys(raw_needed + extra_cols))
+        needed = list(dict.fromkeys(raw_needed + extra_cols + (true_tau_cols if gen_any else [])))
         if 'taup_charge' in avail:
             needed.append('taup_charge')
         df = pd.read_parquet(path, columns=needed)
@@ -418,9 +434,25 @@ def _load_one(path, var_prefix, extra_cols):
         df = _swap_to_physical_charge(df, var_prefix)
         # imported lazily -- Evaluation_Tools.py pulls in torch at module scope
         from taupolaris.python.Evaluation_Tools import compute_spin_vars
-        df = compute_spin_vars(df, tau_pred_prefix=f'{var_prefix}_', tau_vis_prefix='reco_')
+        df = compute_spin_vars(df, tau_pred_prefix=f'{var_prefix}_', tau_vis_prefix='reco_', store_polvecs=gen_any)
+        if gen_any:
+            from taupolaris.python.spin_basis import spin_cosines, taus_from, polvecs_from, gen_polvecs_from_test_file
+            h_p, h_m = polvecs_from(df, f'{var_prefix}_')
+            if args.gen_polvecs:
+                if test_file is None:
+                    raise ValueError(f'--gen-polvecs needs a row-aligned test file for {path}')
+                h_p, h_m, check = gen_polvecs_from_test_file(test_file, len(df))
+                if np.abs(check - df['true_tau_plus_px'].values).max() > 1e-2:
+                    raise ValueError(f'{test_file} is not row-aligned with {path} (true tau+ px differ)')
+            taup4, taun4 = taus_from(df, 'true_' if args.gen_taus else f'{var_prefix}_')
+            for k, v in spin_cosines(h_p, h_m, taup4, taun4).items():
+                df[f'{var_prefix}_{k}'] = v
+            print(f"  {path}: cos variables rebuilt with {'generator' if args.gen_taus else 'reconstructed'} basis and "
+                  f"{'generator' if args.gen_polvecs else 'reconstructed'} polarimetric vectors")
         return df.reset_index(drop=True)
 
+    if gen_any:
+        raise ValueError(f"{path}: --gen-taus/--gen-polvecs need the raw reconstructed kinematics in the file")
     if all(c in avail for c in cos_cols):
         print(f"  WARNING: raw kinematics not found in {path}, falling back to "
               f"cached cos columns for '{var_prefix}' -- these may be stale for a1 "
@@ -432,11 +464,11 @@ def _load_one(path, var_prefix, extra_cols):
                       f"kinematics needed to derive them are present.")
 
 
-def load_channel_files(sig_path, bkg_path, var_prefix, measure_B):
+def load_channel_files(sig_path, bkg_path, var_prefix, measure_B, sig_test=None, bkg_test=None):
     sig_extra = _wt_cols + ((_B_wt_cols) if measure_B else []) + _cut_cols
     bkg_extra = _cut_cols
-    df_sig = _load_one(sig_path, var_prefix, sig_extra)
-    df_bkg = _load_one(bkg_path, var_prefix, bkg_extra)
+    df_sig = _load_one(sig_path, var_prefix, sig_extra, sig_test)
+    df_bkg = _load_one(bkg_path, var_prefix, bkg_extra, bkg_test)
     return df_sig, df_bkg
 
 
@@ -450,7 +482,10 @@ else:
 channel_raw = {}
 for ch, (sig_path, bkg_path) in channel_files.items():
     print(f"Loading channel '{ch}': sig={sig_path}, bkg={bkg_path}")
-    df_sig_raw, df_bkg_raw = load_channel_files(sig_path, bkg_path, var_prefix, args.measure_B)
+    if ch != 'tt' and (args.gen_taus or args.gen_polvecs):
+        raise ValueError("--gen-taus/--gen-polvecs are only set up for the fully-hadronic channel: pass --sig-file-sl '' --bkg-file-sl ''")
+    df_sig_raw, df_bkg_raw = load_channel_files(sig_path, bkg_path, var_prefix, args.measure_B,
+                                                args.sig_test_file if ch == 'tt' else None, args.bkg_test_file if ch == 'tt' else None)
     channel_raw[ch] = (df_sig_raw, df_bkg_raw)
     print(f"  loaded {len(df_sig_raw)} sig events, {len(df_bkg_raw)} bkg events")
 
@@ -712,6 +747,13 @@ for Cij, (Cij_val, Cij_low, Cij_high) in measured_Cij_values.items():
 print("\nTrue Cij values:")
 for Cij in Cij_elements:
     print(f"C{Cij}: C{Cij} = {GetMatrixCoefficient(C_exp, Cij):.3f}")
+import json
+with open(f"{args.outdir}/asimov_Cij.json", "w") as _f:
+    json.dump({'gen_taus': args.gen_taus, 'gen_polvecs': args.gen_polvecs, 'model': args.model,
+               'categories': [c['name'] for c in categories],
+               'Cij': {k: {'value': float(v[0]), 'err_up': float(v[2] - v[0]), 'err_down': float(v[0] - v[1]),
+                           'true': float(GetMatrixCoefficient(C_exp, k))} for k, v in measured_Cij_values.items()}}, _f, indent=1)
+print(f">> wrote {args.outdir}/asimov_Cij.json")
 
 # --- B vector measurement ---
 measured_B_values = {}

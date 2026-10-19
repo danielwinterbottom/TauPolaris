@@ -296,7 +296,7 @@ def flow_map_predict(
     return samples_norm_alt, samples_alt
 
 
-def compute_spin_vars(df, tau_pred_prefix='true_', tau_vis_prefix=''):
+def compute_spin_vars(df, tau_pred_prefix='true_', tau_vis_prefix='', store_polvecs=False):
 
     taup = df[[f'{tau_pred_prefix}tau_plus_E', f'{tau_pred_prefix}tau_plus_px', f'{tau_pred_prefix}tau_plus_py', f'{tau_pred_prefix}tau_plus_pz']].values
     taun = df[[f'{tau_pred_prefix}tau_minus_E', f'{tau_pred_prefix}tau_minus_px', f'{tau_pred_prefix}tau_minus_py', f'{tau_pred_prefix}tau_minus_pz']].values
@@ -391,6 +391,12 @@ def compute_spin_vars(df, tau_pred_prefix='true_', tau_vis_prefix=''):
     # now add these to the dataframe
     for key, values in spin_angles.items():
         df[f'{tau_pred_prefix}{key}'] = values
+    if store_polvecs:
+        # the polarimetric vectors themselves (tau rest frames reached through the ditau frame, lab-aligned axes),
+        # e.g. to project them onto a different (n, r, k) basis -- see taupolaris/python/spin_basis.py
+        for c, k in enumerate('xyz'):
+            df[f'{tau_pred_prefix}h_plus_{k}'] = taup_s[:, c]
+            df[f'{tau_pred_prefix}h_minus_{k}'] = taun_s[:, c]
 
     return df
 
