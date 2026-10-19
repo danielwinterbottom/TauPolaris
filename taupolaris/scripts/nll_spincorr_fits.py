@@ -40,7 +40,8 @@ parser.add_argument("--measure-B", action="store_true", help="Also measure B vec
 parser.add_argument("--gen-taus", action="store_true",
                     help="Build the (n, r, k) basis from the GENERATOR-level taus (true_tau_plus/minus_*) instead of the "
                          "reconstructed ones -- separates the effect of the reconstructed basis direction (k = tau+ "
-                         "direction in the ditau rest frame) on the measured C_ij. Applied to signal and background.")
+                         "direction in the ditau rest frame) on the measured C_ij. Applied to signal and background, "
+                         "fully-hadronic and semileptonic.")
 parser.add_argument("--gen-polvecs", action="store_true",
                     help="Use the GENERATOR-level polarimetric vectors (ts_hh_* from --sig-test-file/--bkg-test-file, "
                          "which the wt_hp_*_hm_* spin weights follow) instead of the reconstructed ones. With --gen-taus "
@@ -49,6 +50,10 @@ parser.add_argument("--sig-test-file", default="prepared_LHC_data_sep01/ppToHToT
                     help="Prepared test dataframe row-aligned with --sig-file (source of the generator-level polarimetric vectors for --gen-polvecs).")
 parser.add_argument("--bkg-test-file", default="prepared_LHC_data_oct04/ppToZToTauTau_AllDM_Jul20/test_dataframe_onorm_leptonic_mode_0_transformer.parquet",
                     help="Prepared test dataframe row-aligned with --bkg-file (for --gen-polvecs).")
+parser.add_argument("--sig-test-file-sl", default="/vols/cms/lcr119/offline/HiggsCP/DiTauEntanglement/prepared_data/ppToHToTauTau_AllDM_UnCorr_Jul20_eval/test_dataframe__leptonic_mode_1_transformer_incFastMTT.parquet",
+                    help="Prepared test dataframe row-aligned with --sig-file-sl (for --gen-polvecs).")
+parser.add_argument("--bkg-test-file-sl", default="/vols/cms/lcr119/offline/HiggsCP/DiTauEntanglement/prepared_data/ppToZToTauTau_AllDM_Jul20/test_dataframe__leptonic_mode_1_transformer_incFastMTT.parquet",
+                    help="Prepared test dataframe row-aligned with --bkg-file-sl (for --gen-polvecs).")
 args = parser.parse_args()
 print(f">> spin basis from {'GENERATOR' if args.gen_taus else 'reconstructed'} taus, polarimetric vectors "
       f"{'GENERATOR' if args.gen_polvecs else 'reconstructed'}")
@@ -441,8 +446,13 @@ def _load_one(path, var_prefix, extra_cols, test_file=None):
             if args.gen_polvecs:
                 if test_file is None:
                     raise ValueError(f'--gen-polvecs needs a row-aligned test file for {path}')
-                h_p, h_m, check = gen_polvecs_from_test_file(test_file, len(df))
-                if np.abs(check - df['true_tau_plus_px'].values).max() > 1e-2:
+                h_p, h_m, px_p, px_m = gen_polvecs_from_test_file(test_file, len(df))
+                if 'taup_charge' in df.columns:
+                    # semileptonic: same leg swap as _swap_to_physical_charge applied to the results columns
+                    flip = df['taup_charge'].values < 0
+                    h_p, h_m = np.where(flip[:, None], h_m, h_p), np.where(flip[:, None], h_p, h_m)
+                    px_p = np.where(flip, px_m, px_p)
+                if np.abs(px_p - df['true_tau_plus_px'].values).max() > 1e-2:
                     raise ValueError(f'{test_file} is not row-aligned with {path} (true tau+ px differ)')
             taup4, taun4 = taus_from(df, 'true_' if args.gen_taus else f'{var_prefix}_')
             for k, v in spin_cosines(h_p, h_m, taup4, taun4).items():
@@ -482,10 +492,8 @@ else:
 channel_raw = {}
 for ch, (sig_path, bkg_path) in channel_files.items():
     print(f"Loading channel '{ch}': sig={sig_path}, bkg={bkg_path}")
-    if ch != 'tt' and (args.gen_taus or args.gen_polvecs):
-        raise ValueError("--gen-taus/--gen-polvecs are only set up for the fully-hadronic channel: pass --sig-file-sl '' --bkg-file-sl ''")
-    df_sig_raw, df_bkg_raw = load_channel_files(sig_path, bkg_path, var_prefix, args.measure_B,
-                                                args.sig_test_file if ch == 'tt' else None, args.bkg_test_file if ch == 'tt' else None)
+    tests = (args.sig_test_file, args.bkg_test_file) if ch == 'tt' else (args.sig_test_file_sl, args.bkg_test_file_sl)
+    df_sig_raw, df_bkg_raw = load_channel_files(sig_path, bkg_path, var_prefix, args.measure_B, *tests)
     channel_raw[ch] = (df_sig_raw, df_bkg_raw)
     print(f"  loaded {len(df_sig_raw)} sig events, {len(df_bkg_raw)} bkg events")
 

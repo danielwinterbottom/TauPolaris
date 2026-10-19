@@ -5,8 +5,9 @@ from that of the reconstructed polarimetric vectors.
 
 The basis follows kinematic_helpers.compute_spin_angles (k = tau+ direction in the ditau rest frame of the given taus,
 n = p x k and r = p - k (p.k) with the beam axis p = (0,0,-1)); the polarimetric vectors are unit vectors in the tau
-rest frames with lab-aligned axes, as stored by compute_spin_vars(store_polvecs=True) and as ts_hh_{taup,taun}_{x,y,z}
-(the generator-level ones in the prepared dataframes, which the wt_hp_*_hm_* spin weights follow exactly).
+rest frames with lab-aligned axes, as stored by compute_spin_vars(store_polvecs=True) and as ts_hh_{leg}_{x,y,z}
+(TAUOLA's polarimetric vectors at generator level in the prepared dataframes, which the wt_hp_*_hm_* spin weights
+follow exactly).
 """
 import numpy as np
 
@@ -40,11 +41,16 @@ def polvecs_from(df, prefix):
 
 
 def gen_polvecs_from_test_file(path, n_rows):
-    """Generator-level polarimetric vectors ts_hh_{taup,taun}_{x,y,z} from a prepared test dataframe that is row-aligned
-    with the results file (checked by the caller)."""
+    """Generator-level polarimetric vectors (TAUOLA's ts_hh) from a prepared test dataframe that is row-aligned with
+    the results file. The legs are as labelled in the test file: taup/taun (fully-hadronic) or tau1/tau2 (semileptonic,
+    tau1 = the leptonic tau, i.e. the stored 'taup' of the results file before the physical-charge swap). Returns
+    (h_first, h_second, px_first, px_second), the last two being undecayed_{leg}_px for the caller's alignment check."""
     import pyarrow.parquet as pq
-    cols = [f'ts_hh_{t}_{c}' for t in ('taup', 'taun') for c in 'xyz'] + ['undecayed_taup_px']
+    names = pq.ParquetFile(path).schema_arrow.names
+    legs = ('taup', 'taun') if 'ts_hh_taup_x' in names else ('tau1', 'tau2')
+    cols = [f'ts_hh_{t}_{c}' for t in legs for c in 'xyz'] + [f'undecayed_{t}_px' for t in legs]
     t = pq.read_table(path, columns=cols).to_pandas()
     if len(t) != n_rows:
         raise ValueError(f'{path}: {len(t)} rows, but the results file has {n_rows} -- not row-aligned')
-    return t[cols[0:3]].to_numpy(float), t[cols[3:6]].to_numpy(float), t['undecayed_taup_px'].to_numpy(float)
+    return (t[cols[0:3]].to_numpy(float), t[cols[3:6]].to_numpy(float),
+            t[cols[6]].to_numpy(float), t[cols[7]].to_numpy(float))
