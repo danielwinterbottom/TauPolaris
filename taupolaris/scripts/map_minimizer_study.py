@@ -17,7 +17,7 @@ recomputed with the same function at its end point, so they are directly compara
               path explores: on some events it finds a much higher peak (e.g. log p 11.8 vs 6.0) that z = 0 and the random
               starts all miss, so it is kept as part of the per-event 'best maximum found'.
   minuit_multi  MIGRAD from z = 0 plus the same N_RANDOM random starts; best of all (11x the cost of minuit, so it
-              can be run on fewer events with --n_events_minuit_multi)
+              can be run on fewer events with --n_events_slow, as can minuit_numeric)
 
 Stored per event (row index event_index in the test file): the final log p of every start (logp_starts; NLL = -log p),
 the latent end points, log p at the convergence checkpoints (gradient methods), the decoded MAP of the best start
@@ -269,7 +269,9 @@ def main():
     ap.add_argument('--n_events', type=int, default=1000)
     ap.add_argument('--chunk', type=int, default=1000)
     ap.add_argument('--threads', type=int, default=8)
-    ap.add_argument('--n_events_minuit_multi', type=int, default=None, help='events for minuit_multi (default: --n_events)')
+    ap.add_argument('--n_events_slow', type=int, default=None,
+                    help='events for the slow methods minuit_multi and minuit_numeric (the FIRST n of the same file, so they are '
+                         'a subset of the events the other methods use; default: --n_events)')
     ap.add_argument('--minuit_mode', choices=('gradient64', 'numeric'), default='gradient64')
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -279,7 +281,7 @@ def main():
         for m in METHODS:                                            # one process per method: clean time and memory
             subprocess.run([sys.executable, '-u', __file__, '-c', args.config, '--model_path', args.model_path, '--test_file', args.test_file,
                             '--outdir', args.outdir, '--method', m,
-                            '--n_events', str(args.n_events_minuit_multi or args.n_events) if m == 'minuit_multi' else str(args.n_events), '--chunk', str(args.chunk),
+                            '--n_events', str(args.n_events_slow or args.n_events) if m in ('minuit_multi', 'minuit_numeric') else str(args.n_events), '--chunk', str(args.chunk),
                             '--threads', str(args.threads), '--minuit_mode', args.minuit_mode], check=False)
         compare(args)
     elif args.method == 'compare':
