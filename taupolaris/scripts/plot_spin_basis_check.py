@@ -1,4 +1,4 @@
-"""cos_r(+) cos_k(-) with the helicity basis built from the reconstructed taus vs from the generator taus (referee:
+"""cos_i(+) cos_j(-) (default cos_r(+) cos_k(-), --var) with the helicity basis built from the reconstructed taus vs from the generator taus (referee:
 resolution of the k axis). The polarimetric vectors are the same in both (reconstructed by default, --polvecs gen for
 the generator ones), so the difference is the basis alone.
 
@@ -7,7 +7,7 @@ C = diag(1, 1, -1)). Writes a 1D comparison (weighted mean and RMS in the legend
 reco basis - gen basis, and a 2D reco-basis vs gen-basis plot.
 
     python taupolaris/scripts/plot_spin_basis_check.py [--results <nu-method results parquet>] [--test_file <row-aligned
-        prepared test parquet>] [--var rk|kr] [--polvecs reco|gen] [--n_events N] --outdir <dir>
+        prepared test parquet>] [--var rk|kr|kk|...] [--polvecs reco|gen] [--n_events N] --outdir <dir>
 """
 import argparse
 import os
@@ -72,7 +72,7 @@ def main():
     ap.add_argument('--results', default='outputs_Flow_Uncorr_Masked_Hadronic_100e_July28/output_results.parquet')
     ap.add_argument('--test_file', default='prepared_LHC_data_sep01/ppToHToTauTau_AllDM_UnCorr_Jul20/test_dataframe__leptonic_mode_0_transformer.parquet')
     ap.add_argument('--var_prefix', default='map_pred')
-    ap.add_argument('--var', default='rk', choices=['rk', 'kr'], help='rk: cos_r(+) cos_k(-), kr: cos_k(+) cos_r(-)')
+    ap.add_argument('--var', default='rk', choices=[i + j for i in AX for j in AX], help='ij: cos_i(+) cos_j(-), e.g. rk, kr, kk')
     ap.add_argument('--polvecs', default='reco', choices=['reco', 'gen'])
     ap.add_argument('--n_events', type=int, default=0)
     ap.add_argument('--outdir', required=True)
@@ -95,8 +95,7 @@ def main():
         ax.stairs(hh / (hh.sum() * np.diff(edges)), edges, color=col, lw=1.8, baseline=None,
                   label=f'{name} τ basis:  mean = {mean:+.4f},  RMS = {rms:.4f}')
         print(f'{name} basis: mean {mean:+.5f}  RMS {rms:.5f}')
-    ax.set_xlabel(xlab, color=INK); ax.set_ylabel('normalised to unit area', color=INK)
-    ax.set_title(f'SM-weighted H→ττ (hadronic), {a.polvecs} polarimetric vectors', loc='left', fontsize=10, color=INK)
+    ax.set_xlabel(xlab, color=INK); ax.set_ylabel('a.u.', color=INK)
     style(ax)
     lo, hi = ax.get_ylim(); ax.set_ylim(0, hi * 1.2)
     ax.legend(frameon=False, fontsize=9, loc='upper left', labelcolor=INK)
@@ -116,8 +115,7 @@ def main():
     ax.stairs(hh / (hh.sum() * np.diff(ed)), ed, color=RECO, lw=1.8, baseline=None,
               label=f'mean = {mean:+.5f},  RMS = {rms:.4f}\n|Δ| > 0.5: {out:.2e} (in edge bins)')
     ax.set_yscale('log')
-    ax.set_xlabel(f'{xlab} (reco τ basis) − (gen τ basis)', color=INK); ax.set_ylabel('normalised to unit area', color=INK)
-    ax.set_title(f'SM-weighted H→ττ (hadronic), {a.polvecs} polarimetric vectors', loc='left', fontsize=10, color=INK)
+    ax.set_xlabel(f'{xlab} (reco τ basis) − (gen τ basis)', color=INK); ax.set_ylabel('a.u.', color=INK)
     style(ax)
     ax.legend(frameon=False, fontsize=9, loc='upper left', labelcolor=INK, handlelength=0)
     fig.tight_layout()
@@ -133,8 +131,8 @@ def main():
     h2 = ax.hist2d(x, y, bins=[e2, e2], weights=w, cmap='Blues')
     ax.plot([-1, 1], [-1, 1], color=MUTED, lw=0.8, ls='--')
     ax.set_xlabel(f'{xlab}, gen τ basis', color=INK); ax.set_ylabel(f'{xlab}, reco τ basis', color=INK)
-    ax.set_title(f'{a.polvecs} polarimetric vectors; correlation {np.corrcoef(x, y)[0, 1]:.3f}', loc='left', fontsize=10, color=INK)
-    fig.colorbar(h2[3], ax=ax, fraction=0.046, label='weighted events')
+    ax.text(0.04, 0.96, f'correlation {np.corrcoef(x, y)[0, 1]:.3f}', transform=ax.transAxes, va='top', fontsize=10, color=INK)
+    fig.colorbar(h2[3], ax=ax, fraction=0.046, label='a.u.')
     fig.tight_layout()
     for ext in ('pdf', 'png'):
         fig.savefig(os.path.join(a.outdir, f'cos{tag}_2d.{ext}'), dpi=120)
