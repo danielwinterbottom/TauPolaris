@@ -122,7 +122,7 @@ def run_method(args):
     model, X, norm, out = load(args.config, args.model_path, args.test_file, args.n_events)
     d = model.flow._distribution._shape[0]
     base = rss_mb()
-    res = {}
+    res = {'loadavg_start': np.array(os.getloadavg()), 'host': np.array(os.uname().nodename)}
     t0 = time.perf_counter()
     with PeakRSS() as mem:
         if args.method in ('grad200', 'grad1000', 'multi200', 'multi1000'):
@@ -190,10 +190,12 @@ def run_method(args):
     res['x_best_std'] = xb.astype(np.float32)
     res['x_best'] = xb * norm['output_std'].reshape(-1) + norm['output_mean'].reshape(-1)
     res['output_names'] = np.array(out)
+    res['loadavg_end'] = np.array(os.getloadavg())
     res['time_s'] = dt; res['peak_mem_mb'] = mem.peak - base; res['baseline_mem_mb'] = base
     res['threads'] = args.threads; res['n_events'] = len(X)
     np.savez(os.path.join(args.outdir, f'{args.method}.npz'), **res)
-    print(f'>> {args.method}: {len(X)} events, {dt:.1f} s ({1e3 * dt / len(X):.2f} ms/event), '
+    print(f'>> {args.method} on {res["host"]}: load average {res["loadavg_start"][0]:.1f} -> {res["loadavg_end"][0]:.1f}; '
+          f'{len(X)} events, {dt:.1f} s ({1e3 * dt / len(X):.2f} ms/event), '
           f'peak extra memory {mem.peak - base:.0f} MB (baseline {base:.0f} MB)', flush=True)
 
 
