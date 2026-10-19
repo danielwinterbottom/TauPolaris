@@ -86,6 +86,10 @@ def features(args, cfg):
     samples = {'train': [(split('train', d), args.n_train_per_dataset) for d in D['datasets']],
                'val': [(split('val', d), args.n_val_per_dataset) for d in D['datasets']],
                'test': [(test, args.n_test)]}
+    if args.bkg_test:
+        samples['bkg'] = [(args.bkg_test, args.n_test)]
+    if args.only:
+        samples = {k: v for k, v in samples.items() if k in args.only.split(',')}
     om, osd = norm['output_mean'].reshape(-1), norm['output_std'].reshape(-1)
     for name, files in samples.items():
         parts, t0 = [], time.time()
@@ -209,9 +213,15 @@ def load_head(path):
 
 
 def apply(args, cfg):
+    for name in (args.only.split(',') if args.only else ('test', 'bkg')):
+        if name in ('test', 'bkg') and os.path.exists(os.path.join(args.workdir, f'spin_features_{name}.npz')):
+            apply_one(args, cfg, name)
+
+
+def apply_one(args, cfg, name):
     _, norm, out = load_regressor(cfg); idx = out_index(out)
     om, osd = norm['output_mean'].reshape(-1)[idx], norm['output_std'].reshape(-1)[idx]
-    f = dict(np.load(os.path.join(args.workdir, 'spin_features_test.npz')))
+    f = dict(np.load(os.path.join(args.workdir, f'spin_features_{name}.npz')))
     res = {'phi_p': f['phi_p'], 'phi_t': f['phi_t'], 'dm_p': f['dm_p'], 'dm_n': f['dm_n'], 'w0': f['w0'], 'w90': f['w90']}
     for k, o in enumerate(OBS):
         res[f'pred_{o}'], res[f'true_{o}'] = f['obs_p'][:, k], f['obs_t'][:, k]
@@ -242,12 +252,13 @@ def apply(args, cfg):
     for k, o in enumerate(OBS):
         res[f'sig_cov_{o}'] = sig_cov[:, k]
     res['sig_cov_phiCP'] = phi_cov
-    if args.phicp_results:
-        p = pd.read_parquet(args.phicp_results, columns=['pred_phiCP', 'pred_phiCP_err'])
+    phicp_results = args.phicp_results if name == 'test' else args.phicp_results_bkg
+    if phicp_results:
+        p = pd.read_parquet(phicp_results, columns=['pred_phiCP', 'pred_phiCP_err'])
         assert len(p) == len(X) and np.allclose(np.cos(p.pred_phiCP.to_numpy() - f['phi_p']), 1, atol=1e-4), 'phiCP head results not row-aligned'
         res['sig_phicp'] = p.pred_phiCP_err.to_numpy(np.float32)
-    pd.DataFrame(res).to_parquet(os.path.join(args.workdir, 'spin_uncertainties_test.parquet'))
-    print('>> spin_uncertainties_test.parquet written')
+    pd.DataFrame(res).to_parquet(os.path.join(args.workdir, f'spin_uncertainties_{name}.parquet'))
+    print(f'>> spin_uncertainties_{name}.parquet written')
 
 
 # ---------------------------------------------------------------------------------------------- compare
@@ -311,6 +322,9 @@ def main():
     ap.add_argument('--stage', choices=('features', 'train', 'apply', 'compare'), required=True)
     ap.add_argument('--which', choices=('both', 'obs', 'cov'), default='both')
     ap.add_argument('--phicp_results', default=None)
+    ap.add_argument('--phicp_results_bkg', default=None, help='phicp_uncertainty_head results for the background sample')
+    ap.add_argument('--bkg_test', default=None, help='a background test parquet (e.g. Z->tautau) to also process in features/apply')
+    ap.add_argument('--only', default=None, help='comma-separated subset of samples for features/apply (train,val,test,bkg)')
     ap.add_argument('--n_train_per_dataset', type=int, default=500_000)
     ap.add_argument('--n_val_per_dataset', type=int, default=200_000)
     ap.add_argument('--n_test', type=int, default=0)
