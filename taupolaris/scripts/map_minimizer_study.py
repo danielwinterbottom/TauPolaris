@@ -177,6 +177,14 @@ def run_method(args):
                         lp[i, j] = logp_z(model, zz, ctx).item()
                     nfcn[i, j] = m.nfcn; valid[i, j] = m.valid; zs[i, j] = np.array(m.values)
                 t_ev[i] = time.perf_counter() - ti
+                if (i + 1) % 10 == 0 and i + 1 < len(X):
+                    # partial results, so a job that runs out of time still leaves the events it finished
+                    n = i + 1
+                    np.savez(os.path.join(args.outdir, f'{args.method}_partial.npz'), logp_starts=lp[:n], z_starts=zs[:n],
+                             nfcn=nfcn[:n], valid=valid[:n].astype(bool), time_per_event_s=t_ev[:n], event_index=np.arange(n),
+                             time_s=time.perf_counter() - t0, n_events=n, peak_mem_mb=mem.peak - base, threads=args.threads,
+                             host=res['host'], loadavg_start=res['loadavg_start'])
+                    print(f'  {args.method}: {n}/{len(X)} events, {t_ev[:n].mean():.1f} s/event', flush=True)
             res['logp_starts'], res['z_starts'], res['nfcn'], res['valid'] = lp, zs, nfcn, valid.astype(bool)
             res['time_per_event_s'] = t_ev
     dt = time.perf_counter() - t0
@@ -201,7 +209,14 @@ def run_method(args):
 
 def compare(args):
     import pandas as pd
-    R = {m: dict(np.load(os.path.join(args.outdir, f'{m}.npz'))) for m in METHODS if os.path.exists(os.path.join(args.outdir, f'{m}.npz'))}
+    R = {}
+    for m in METHODS:                         # a finished method, else the partial results of one still running / timed out
+        for f in (f'{m}.npz', f'{m}_partial.npz'):
+            if os.path.exists(os.path.join(args.outdir, f)):
+                R[m] = dict(np.load(os.path.join(args.outdir, f)))
+                if f.endswith('_partial.npz'):
+                    print(f'>> {m}: partial results, {int(R[m]["n_events"])} events')
+                break
     n = min(r['logp_starts'].shape[0] for r in R.values())           # events common to every method (the first n)
     best_of = {m: r['logp_starts'][:n].max(1) for m, r in R.items()}
     if 'minuit_multi' in R:
