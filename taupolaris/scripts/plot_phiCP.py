@@ -402,6 +402,9 @@ def main():
                         help="Load a single TauSpinner-reweightable ('uncorr') sample instead of "
                              "separate even/odd/mix files, and use tauspinner_wt_alpha0/90/45 as "
                              "histogram weights for the CP-even/CP-odd/CP-mix curves.")
+    parser.add_argument('--input', default=None,
+                        help="With --uncorrelated: the results parquet to use instead of options['files']['uncorr'] "
+                             "(or 'sl_uncorr' with --leptonic_mode 1).")
 
     args = parser.parse_args()
 
@@ -419,6 +422,10 @@ def main():
     use_map = not args.useMLP
     dm_pfx = 'true' if args.GENfilter else 'reco'
 
+    if args.input is not None:
+        if not args.uncorrelated:
+            parser.error('--input needs --uncorrelated')
+        options['files'][f'{prefix}uncorr'] = args.input
     if args.uncorrelated:
         uncorr_df = load_data(prefix=prefix, uncorrelated=True)
         uncorr_df = add_or_get_DM(uncorr_df, dm_prefix=dm_pfx)
@@ -534,7 +541,7 @@ def main():
         )
 
     print(asymmetry_dict)
-    with open('asymmetry.yaml', 'w') as file:
+    with open(f"{args.output_dir}/logs/asymmetry_{options[args.option]['tag']}.yaml", 'w') as file:
         yaml.dump(asymmetry_dict, file)
 
 
