@@ -138,6 +138,8 @@ def run_method(args):
     torch.set_num_threads(args.threads); torch.manual_seed(1)
     dev = torch.device(args.device)
     gpu = dev.type == 'cuda'
+    if gpu and dev.index is None:   # the torch.cuda memory functions need an explicit index
+        dev = torch.device('cuda', 0)
     if gpu and args.method.startswith('minuit'):
         sys.exit('--device cuda is for the gradient methods only (Minuit evaluates one event at a time)')
     if gpu and args.gpu_mem_gb:
