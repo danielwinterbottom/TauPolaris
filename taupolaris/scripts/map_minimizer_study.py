@@ -27,6 +27,11 @@ Each method runs in its own process on CPU with a fixed number of threads, so th
 memory during the method, sampled every 20 ms, minus the baseline after loading model and data) are clean. Results
 per method go to <outdir>/<method>.npz; '--method compare' writes the comparison table and plots.
 
+The gradient methods can also run on a GPU (--device cuda), for the timing at large chunk sizes: one warm-up chunk is run
+before the clock starts, the peak GPU memory (max_memory_allocated minus the model and data) is stored, and
+--gpu_mem_gb caps what the process may use (e.g. 8, to emulate a smaller card) -- a chunk that does not fit then
+stops with 'OOM' in the summary line and exit status 3.
+
     python taupolaris/scripts/map_minimizer_study.py -c <model config.yaml> --outdir <dir> --n_events N --method all
 """
 import argparse
@@ -71,7 +76,7 @@ class PeakRSS:
         self._stop = True; self.t.join(); self.peak = max(self.peak, rss_mb())
 
 
-def load(cfg_path, model_path, test_file, n_events):
+def load(cfg_path, model_path, test_file, n_events, device='cpu'):
     from taupolaris.python.NN_Tools import load_model, is_legacy_pizero_proj_checkpoint
     cfg = yaml.safe_load(open(cfg_path))
     D, NN = cfg['Data'], cfg['SetupNN']
@@ -79,13 +84,13 @@ def load(cfg_path, model_path, test_file, n_events):
     sd = torch.load(model_path, map_location='cpu', weights_only=True)
     model = load_model(NN['hyperparams'], inp, out, useTransformer=NN.get('use_transformer', True),
                        leptonic_mode=D.get('leptonic_mode', 0), legacy_pizero_proj=is_legacy_pizero_proj_checkpoint(sd))
-    model.load_state_dict(sd); model.float().eval()
+    model.load_state_dict(sd); model.float().eval().to(device)
     for p in model.parameters():
         p.requires_grad_(False)
     norm = np.load(os.path.join(os.path.dirname(os.path.dirname(model_path)) if model_path.endswith('plots/best_model.pth')
                                 else os.path.dirname(model_path), 'normalization_params.npz'))
     df = next(pq.ParquetFile(test_file).iter_batches(batch_size=n_events, columns=inp)).to_pandas()
-    X = torch.from_numpy(((df[inp].to_numpy(np.float32) - norm['input_mean']) / norm['input_std']).astype(np.float32))
+    X = torch.from_numpy(((df[inp].to_numpy(np.float32) - norm['input_mean']) / norm['input_std']).astype(np.float32)).to(device)
     return model, X, norm, out
 
 
@@ -107,7 +112,7 @@ def adam_ascent(model, z0, ctx, n_steps, lr=1e-2, record=None):
     for step in range(n_steps + 1):
         if record is not None and step in CHECKPOINTS:
             with torch.no_grad():
-                record[step] = logp_z(model, z, ctx).numpy().copy()
+                record[step] = logp_z(model, z, ctx).cpu().numpy().copy()
         if step == n_steps:
             break
         opt.zero_grad()
@@ -117,94 +122,127 @@ def adam_ascent(model, z0, ctx, n_steps, lr=1e-2, record=None):
         return z.detach(), logp_z(model, z, ctx)
 
 
+def grad_chunk(model, Xc, z_rand, n_starts, n_steps, d, record=None):
+    """One chunk of a gradient method: Adam from z = 0 (plus the random starts z_rand for multi-start)."""
+    C = len(Xc)
+    with torch.no_grad():
+        ctx = model.condition_net(Xc)
+    z0 = torch.zeros(C, n_starts, d, device=Xc.device)
+    if n_starts > 1:
+        z0[:, 1:] = z_rand
+    z, lp = adam_ascent(model, z0.reshape(C * n_starts, d), ctx.repeat_interleave(n_starts, 0), n_steps, record=record)
+    return z.reshape(C, n_starts, d).cpu().numpy(), lp.reshape(C, n_starts).cpu().numpy()
+
+
 def run_method(args):
     torch.set_num_threads(args.threads); torch.manual_seed(1)
-    model, X, norm, out = load(args.config, args.model_path, args.test_file, args.n_events)
+    dev = torch.device(args.device)
+    gpu = dev.type == 'cuda'
+    if gpu and args.method.startswith('minuit'):
+        sys.exit('--device cuda is for the gradient methods only (Minuit evaluates one event at a time)')
+    if gpu and args.gpu_mem_gb:
+        torch.cuda.set_per_process_memory_fraction(
+            min(1.0, args.gpu_mem_gb * 1024 ** 3 / torch.cuda.get_device_properties(dev).total_memory), dev)
+    model, X, norm, out = load(args.config, args.model_path, args.test_file, args.n_events, dev)
     d = model.flow._distribution._shape[0]
-    base = rss_mb()
-    res = {'loadavg_start': np.array(os.getloadavg()), 'host': np.array(os.uname().nodename)}
-    t0 = time.perf_counter()
-    with PeakRSS() as mem:
-        if args.method in ('grad200', 'grad1000', 'multi200', 'multi1000'):
-            n_steps = 200 if args.method.endswith('200') else 1000
-            n_starts = 1 + (N_RANDOM if args.method.startswith('multi') else 0)
-            lp_all, z_all, traj = [], [], {k: [] for k in CHECKPOINTS if k <= n_steps}
-            rs = torch.from_numpy(random_starts(len(X), d))
-            for s in range(0, len(X), args.chunk):
-                Xc = X[s:s + args.chunk]; C = len(Xc)
-                with torch.no_grad():
-                    ctx = model.condition_net(Xc)
-                z0 = torch.zeros(C, n_starts, d)
-                if n_starts > 1:
-                    z0[:, 1:] = rs[s:s + C]
-                rec = {}
-                z, lp = adam_ascent(model, z0.reshape(C * n_starts, d), ctx.repeat_interleave(n_starts, 0), n_steps, record=rec)
-                lp_all.append(lp.reshape(C, n_starts).numpy()); z_all.append(z.reshape(C, n_starts, d).numpy())
+    res = {'loadavg_start': np.array(os.getloadavg()), 'host': np.array(os.uname().nodename), 'device': np.array(args.device)}
+    where = res['host']
+    if gpu:
+        res['gpu_name'] = np.array(torch.cuda.get_device_name(dev))
+        where = f"{res['host']} ({res['gpu_name']}, limit {args.gpu_mem_gb or 'none'} GB)"
+    try:
+        if gpu:   # warm-up: CUDA context, kernels and the caching allocator, outside the timing
+            Xw = X[:args.chunk]
+            grad_chunk(model, Xw, torch.randn(len(Xw), N_RANDOM, d, device=dev), 1 + N_RANDOM * args.method.startswith('multi'), 5, d)
+            torch.cuda.synchronize(dev); torch.cuda.reset_peak_memory_stats(dev)
+            res['baseline_gpu_mem_mb'] = torch.cuda.memory_allocated(dev) / 2 ** 20
+        base = rss_mb()
+        t0 = time.perf_counter()
+        with PeakRSS() as mem:
+            if args.method in ('grad200', 'grad1000', 'multi200', 'multi1000'):
+                n_steps = 200 if args.method.endswith('200') else 1000
+                n_starts = 1 + (N_RANDOM if args.method.startswith('multi') else 0)
+                lp_all, z_all, traj = [], [], {k: [] for k in CHECKPOINTS if k <= n_steps}
+                rs = torch.from_numpy(random_starts(len(X), d))
+                for s in range(0, len(X), args.chunk):
+                    Xc = X[s:s + args.chunk]
+                    rec = {}
+                    z, lp = grad_chunk(model, Xc, rs[s:s + len(Xc)].to(dev), n_starts, n_steps, d, record=rec)
+                    lp_all.append(lp); z_all.append(z)
+                    for k in traj:
+                        traj[k].append(rec[k].reshape(len(Xc), n_starts))
+                res['logp_starts'] = np.concatenate(lp_all)                       # (N, n_starts); column 0 = z=0 start
+                res['z_starts'] = np.concatenate(z_all)
                 for k in traj:
-                    traj[k].append(rec[k].reshape(C, n_starts))
-            res['logp_starts'] = np.concatenate(lp_all)                       # (N, n_starts); column 0 = z=0 start
-            res['z_starts'] = np.concatenate(z_all)
-            for k in traj:
-                res[f'traj_{k}'] = np.concatenate(traj[k])
-        elif args.method in ('minuit', 'minuit_multi', 'minuit_numeric'):
-            from iminuit import Minuit
-            exact = args.minuit_mode == 'gradient64' and args.method != 'minuit_numeric'
-            if exact:
-                model.double(); X = X.double()
-            dtp = torch.float64 if exact else torch.float32
-            n_starts = 1 + (N_RANDOM if args.method == 'minuit_multi' else 0)
-            starts = np.zeros((len(X), n_starts, d))
-            if n_starts > 1:
-                starts[:, 1:] = random_starts(len(X), d)
-            lp, nfcn, valid = np.zeros((len(X), n_starts)), np.zeros((len(X), n_starts)), np.zeros((len(X), n_starts))
-            zs = np.zeros((len(X), n_starts, d))
-            t_ev = np.zeros(len(X))
-            for i in range(len(X)):
-                ti = time.perf_counter()
-                with torch.no_grad():
-                    ctx = model.condition_net(X[i:i + 1])
-                    f = lambda zz: -logp_z(model, torch.as_tensor(zz, dtype=dtp).unsqueeze(0), ctx).item()
-
-                def g(zz, ctx=ctx):
-                    zt = torch.as_tensor(zz, dtype=dtp).unsqueeze(0).requires_grad_(True)
-                    (-logp_z(model, zt, ctx).sum()).backward()
-                    return zt.grad[0].double().numpy()
-                for j in range(n_starts):
-                    m = Minuit(f, starts[i, j], grad=g) if exact else Minuit(f, starts[i, j])
-                    m.errordef = Minuit.LIKELIHOOD; m.migrad()
-                    zz = torch.tensor(np.array(m.values), dtype=dtp).unsqueeze(0)
+                    res[f'traj_{k}'] = np.concatenate(traj[k])
+            elif args.method in ('minuit', 'minuit_multi', 'minuit_numeric'):
+                from iminuit import Minuit
+                exact = args.minuit_mode == 'gradient64' and args.method != 'minuit_numeric'
+                if exact:
+                    model.double(); X = X.double()
+                dtp = torch.float64 if exact else torch.float32
+                n_starts = 1 + (N_RANDOM if args.method == 'minuit_multi' else 0)
+                starts = np.zeros((len(X), n_starts, d))
+                if n_starts > 1:
+                    starts[:, 1:] = random_starts(len(X), d)
+                lp, nfcn, valid = np.zeros((len(X), n_starts)), np.zeros((len(X), n_starts)), np.zeros((len(X), n_starts))
+                zs = np.zeros((len(X), n_starts, d))
+                t_ev = np.zeros(len(X))
+                for i in range(len(X)):
+                    ti = time.perf_counter()
                     with torch.no_grad():
-                        lp[i, j] = logp_z(model, zz, ctx).item()
-                    nfcn[i, j] = m.nfcn; valid[i, j] = m.valid; zs[i, j] = np.array(m.values)
-                t_ev[i] = time.perf_counter() - ti
-                if (i + 1) % 10 == 0 and i + 1 < len(X):
-                    # partial results, so a job that runs out of time still leaves the events it finished
-                    n = i + 1
-                    np.savez(os.path.join(args.outdir, f'{args.method}_partial.npz'), logp_starts=lp[:n], z_starts=zs[:n],
-                             nfcn=nfcn[:n], valid=valid[:n].astype(bool), time_per_event_s=t_ev[:n], event_index=np.arange(n),
-                             time_s=time.perf_counter() - t0, n_events=n, peak_mem_mb=mem.peak - base, threads=args.threads,
-                             host=res['host'], loadavg_start=res['loadavg_start'])
-                    print(f'  {args.method}: {n}/{len(X)} events, {t_ev[:n].mean():.1f} s/event', flush=True)
-            res['logp_starts'], res['z_starts'], res['nfcn'], res['valid'] = lp, zs, nfcn, valid.astype(bool)
-            res['time_per_event_s'] = t_ev
+                        ctx = model.condition_net(X[i:i + 1])
+                        f = lambda zz: -logp_z(model, torch.as_tensor(zz, dtype=dtp).unsqueeze(0), ctx).item()
+
+                    def g(zz, ctx=ctx):
+                        zt = torch.as_tensor(zz, dtype=dtp).unsqueeze(0).requires_grad_(True)
+                        (-logp_z(model, zt, ctx).sum()).backward()
+                        return zt.grad[0].double().numpy()
+                    for j in range(n_starts):
+                        m = Minuit(f, starts[i, j], grad=g) if exact else Minuit(f, starts[i, j])
+                        m.errordef = Minuit.LIKELIHOOD; m.migrad()
+                        zz = torch.tensor(np.array(m.values), dtype=dtp).unsqueeze(0)
+                        with torch.no_grad():
+                            lp[i, j] = logp_z(model, zz, ctx).item()
+                        nfcn[i, j] = m.nfcn; valid[i, j] = m.valid; zs[i, j] = np.array(m.values)
+                    t_ev[i] = time.perf_counter() - ti
+                    if (i + 1) % 10 == 0 and i + 1 < len(X):
+                        # partial results, so a job that runs out of time still leaves the events it finished
+                        n = i + 1
+                        np.savez(os.path.join(args.outdir, f'{args.method}_partial.npz'), logp_starts=lp[:n], z_starts=zs[:n],
+                                 nfcn=nfcn[:n], valid=valid[:n].astype(bool), time_per_event_s=t_ev[:n], event_index=np.arange(n),
+                                 time_s=time.perf_counter() - t0, n_events=n, peak_mem_mb=mem.peak - base, threads=args.threads,
+                                 host=res['host'], loadavg_start=res['loadavg_start'])
+                        print(f'  {args.method}: {n}/{len(X)} events, {t_ev[:n].mean():.1f} s/event', flush=True)
+                res['logp_starts'], res['z_starts'], res['nfcn'], res['valid'] = lp, zs, nfcn, valid.astype(bool)
+                res['time_per_event_s'] = t_ev
+        if gpu:
+            torch.cuda.synchronize(dev)
+    except torch.OutOfMemoryError:
+        print(f'>> {args.method} on {where}: chunk {args.chunk}: OOM', flush=True)
+        sys.exit(3)
     dt = time.perf_counter() - t0
     # per event: row in the test file, and the decoded MAP (best start) in standardised and physical output units
     res['event_index'] = np.arange(len(X))
     best = res['logp_starts'].argmax(1)
-    zb = torch.tensor(res['z_starts'][np.arange(len(X)), best], dtype=next(model.parameters()).dtype)
+    zb = torch.tensor(res['z_starts'][np.arange(len(X)), best], dtype=next(model.parameters()).dtype, device=dev)
     with torch.no_grad():
         xb = torch.cat([model.flow._transform.inverse(zb[s:s + 1000], context=model.condition_net(X[s:s + 1000]))[0]
-                        for s in range(0, len(X), 1000)]).numpy()
+                        for s in range(0, len(X), 1000)]).cpu().numpy()
     res['x_best_std'] = xb.astype(np.float32)
     res['x_best'] = xb * norm['output_std'].reshape(-1) + norm['output_mean'].reshape(-1)
     res['output_names'] = np.array(out)
     res['loadavg_end'] = np.array(os.getloadavg())
     res['time_s'] = dt; res['peak_mem_mb'] = mem.peak - base; res['baseline_mem_mb'] = base
-    res['threads'] = args.threads; res['n_events'] = len(X)
+    res['threads'] = args.threads; res['n_events'] = len(X); res['chunk'] = args.chunk
+    gmem = ''
+    if gpu:
+        res['peak_gpu_mem_mb'] = torch.cuda.max_memory_allocated(dev) / 2 ** 20 - res['baseline_gpu_mem_mb']
+        gmem = f", peak extra GPU memory {res['peak_gpu_mem_mb']:.0f} MB (baseline {res['baseline_gpu_mem_mb']:.0f} MB)"
     np.savez(os.path.join(args.outdir, f'{args.method}.npz'), **res)
-    print(f'>> {args.method} on {res["host"]}: load average {res["loadavg_start"][0]:.1f} -> {res["loadavg_end"][0]:.1f}; '
-          f'{len(X)} events, {dt:.1f} s ({1e3 * dt / len(X):.2f} ms/event), '
-          f'peak extra memory {mem.peak - base:.0f} MB (baseline {base:.0f} MB)', flush=True)
+    print(f'>> {args.method} on {where}: load average {res["loadavg_start"][0]:.1f} -> {res["loadavg_end"][0]:.1f}; '
+          f'{len(X)} events, chunk {args.chunk}, {dt:.1f} s ({1e3 * dt / len(X):.3f} ms/event), '
+          f'peak extra memory {mem.peak - base:.0f} MB (baseline {base:.0f} MB){gmem}', flush=True)
 
 
 def deficit_stats(d):
@@ -292,6 +330,8 @@ def main():
     ap.add_argument('--n_events', type=int, default=1000)
     ap.add_argument('--chunk', type=int, default=1000)
     ap.add_argument('--threads', type=int, default=8)
+    ap.add_argument('--device', default='cpu', help="'cuda' for the gradient methods on a GPU")
+    ap.add_argument('--gpu_mem_gb', type=float, default=None, help='with --device cuda: cap on the GPU memory this process may use')
     ap.add_argument('--n_events_slow', type=int, default=None,
                     help='events for the slow methods minuit_multi and minuit_numeric (the FIRST n of the same file, so they are '
                          'a subset of the events the other methods use; default: --n_events)')
