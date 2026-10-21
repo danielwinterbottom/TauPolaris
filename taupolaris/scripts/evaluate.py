@@ -18,6 +18,7 @@ def main():
     argparser.add_argument('--useMLP', help='whether to use a simple MLP instead of a normalizing flow', action='store_true')
     argparser.add_argument('--useTransformerBaseline', help='whether to use a transformer encoder + regression head instead of a normalizing flow', action='store_true')
     argparser.add_argument('--useCPU', help='whether to use CPU only for evaluation', action='store_true')
+    argparser.add_argument('--dataOnCPU', help='keep the dataset on CPU and only transfer chunks to the model device on demand (reduces GPU memory use at the cost of extra host-device transfers); ignored if --useCPU is set', action='store_true')
     argparser.add_argument('--oneprong', help='whether to only evaluate on 1-prong taus only', action='store_true')
     argparser.add_argument('--threeprong', help='whether to only evaluate on events with at least 1 3-prong tau', action='store_true')
     argparser.add_argument('--make_root_output', help='whether to save the results in a root file as well as a pandas dataframe', action='store_true')
@@ -38,6 +39,8 @@ def main():
 
     # set gpu or cpu
     device = torch.device('cpu') if args.useCPU else get_device()
+    # dataset device: stays on CPU if requested, otherwise lives with the model
+    data_device = torch.device('cpu') if args.dataOnCPU else device
 
     output_dir = f"outputs_{nn_config['model_name']}"
     output_plots_dir = f"{output_dir}/plots"
@@ -187,10 +190,10 @@ def main():
                 reco_taup_sv = np.zeros((len(test_df), 3))
                 reco_taun_sv = np.zeros((len(test_df), 3))
     
-        # move X_test and model to device
+        # move X_test to data_device (CPU if --dataOnCPU) and model to device
         X_test, _ = test_dataset[:]
         del _
-        X_test = X_test.to(device)
+        X_test = X_test.to(data_device)
         model = model.float().to(device)  # nflows' StandardNormal buffer is float64; MPS needs float32
     
         samples_map = None
@@ -201,7 +204,7 @@ def main():
             pred_chunks = []
             with torch.no_grad():
                 for start in range(0, X_test.shape[0], sample_chunk_size):
-                    pred_chunks.append(model(X_test[start:start + sample_chunk_size]).cpu())
+                    pred_chunks.append(model(X_test[start:start + sample_chunk_size].to(device)).cpu())
             predictions_norm = torch.cat(pred_chunks, dim=0)
             del pred_chunks
         else:
@@ -209,7 +212,7 @@ def main():
             pred_chunks = []
             with torch.no_grad():
                 for start in range(0, X_test.shape[0], sample_chunk_size):
-                    chunk = model.sample(num_samples=1, context=X_test[start:start + sample_chunk_size]).squeeze(1)
+                    chunk = model.sample(num_samples=1, context=X_test[start:start + sample_chunk_size].to(device)).squeeze(1)
                     pred_chunks.append(chunk.cpu())
             predictions_norm = torch.cat(pred_chunks, dim=0)
             del pred_chunks
@@ -269,7 +272,7 @@ def main():
             nubar_E_significance = []
             significance_chunks = []
             for i in range(0, X_test.shape[0], sample_chunk_size):
-                chunk = model.sample(num_samples=N_significance_samples, context=X_test[i:i + sample_chunk_size])
+                chunk = model.sample(num_samples=N_significance_samples, context=X_test[i:i + sample_chunk_size].to(device))
                 significance_chunks.append(chunk.cpu())
             significances = torch.cat(significance_chunks, dim=0)
             # destandardize
