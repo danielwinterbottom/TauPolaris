@@ -290,13 +290,21 @@ def main():
             print("Computing alternative predictions using flow_map_predict...")
             map_method = nn_config.get('map_method', 'latent_zero')
             print(f">> Method: {map_method} with chunk size {chunk_size}")
-            _, samples_map = flow_map_predict(
+            # the MAP log p is stored (map_logp) for the methods that return it; for 'gradient' it is the value at the
+            # last Adam step before the final update
+            with_logp = map_method in ('gradient', 'gradient_multistart', 'minuit')
+            map_out = flow_map_predict(
                 model, X_test,
                 test_dataset=test_dataset,
                 num_draws=nn_config.get('map_num_draws', 100),
                 chunk_size= chunk_size,
                 method=map_method,
+                n_steps=nn_config.get('map_n_steps', 200),
+                n_random_starts=nn_config.get('map_n_random_starts', 10),
+                return_log_prob=with_logp,
             )
+            samples_map = map_out[1]
+            map_logp = map_out[2] if with_logp else None
             samples_map = convert_coordinates_pred(samples_map, **conv_kwargs)
       
         # add energies (E=|p|) and build neutrino 4-vectors
@@ -573,7 +581,9 @@ def main():
                 ])
             results_df = pd.concat([results_df, results_df_extra], axis=1)
             del results_df_extra
-            
+            if map_logp is not None:
+                results_df['map_logp'] = map_logp
+
         if args.inc_significance:
             results_df['nu_significance'] = nu_significance
             results_df['nubar_significance'] = nubar_significance
