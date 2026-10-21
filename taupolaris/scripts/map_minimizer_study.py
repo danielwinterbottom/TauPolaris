@@ -207,6 +207,15 @@ def run_method(args):
           f'peak extra memory {mem.peak - base:.0f} MB (baseline {base:.0f} MB)', flush=True)
 
 
+def deficit_stats(d):
+    """Per-event deficit d = (best log p found by any method) - (this method's), in nats: its mean and quantiles (the
+    spread over events), and how often it exceeds 0.01 / 0.1 / 1 nat (density lower than the best peak's by ~1% /
+    ~10% / a factor e)."""
+    q = np.quantile(d, [0.5, 0.68, 0.95, 0.99])
+    return {'mean deficit': d.mean(), 'median': q[0], '68%': q[1], '95%': q[2], '99%': q[3],
+            'frac > 0.01': (d > 0.01).mean(), 'frac > 0.1': (d > 0.1).mean(), 'frac > 1': (d > 1).mean()}
+
+
 def compare(args):
     import pandas as pd
     R = {}
@@ -229,8 +238,7 @@ def compare(args):
     rows = []
     for name, lp in best_of.items():
         m = name.split()[0]; d = ref - lp
-        rows.append({'method': name, 'mean log p': lp.mean(), 'median deficit': np.median(d),
-                     'frac deficit > 0.01': (d > 0.01).mean(), 'frac > 0.1': (d > 0.1).mean(), 'frac > 1': (d > 1).mean(),
+        rows.append({'method': name, 'mean log p': lp.mean(), **deficit_stats(d),
                      'ms/event': 1e3 * R[m]['time_s'] / R[m]['n_events'], 'peak extra MB': float(R[m]['peak_mem_mb'])})
     t = pd.DataFrame(rows)
     pd.set_option('display.width', 220)
@@ -245,9 +253,7 @@ def compare(args):
             if m in big:
                 bo[f'{m} (random starts only)'] = big[m]['logp_starts'][:nb, 1:].max(1)
         refb = np.max(np.stack(list(bo.values())), 0)
-        tb = pd.DataFrame([{'method': k, 'mean log p': v.mean(), 'median deficit': np.median(refb - v),
-                            'frac deficit > 0.01': (refb - v > 0.01).mean(), 'frac > 0.1': (refb - v > 0.1).mean(),
-                            'frac > 1': (refb - v > 1).mean()} for k, v in bo.items()])
+        tb = pd.DataFrame([{'method': k, 'mean log p': v.mean(), **deficit_stats(refb - v)} for k, v in bo.items()])
         print(f'\n=== the methods run on more events: first {nb} events (deficit relative to the best of these methods) ===')
         print(tb.to_string(index=False, float_format=lambda v: f'{v:.4f}'))
         tb.to_csv(os.path.join(args.outdir, f'comparison_{nb}events.csv'), index=False)
