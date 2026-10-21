@@ -311,7 +311,7 @@ def compare(args):
         if m not in R:
             continue
         ks = [k for k in CHECKPOINTS if f'traj_{k}' in R[m]]
-        z0 = [np.mean(ref - R[m][f'traj_{k}'][:, 0]) for k in ks]
+        z0 = [np.mean(ref - R[m][f'traj_{k}'][:n, 0]) for k in ks]
         ax.plot([max(k, 1) for k in ks], z0, 'o-', color=col, label=f'{m}: start z = 0')
         if m == 'multi1000':
             rnd = [np.mean(ref - R[m][f'traj_{k}'][:n, 1:].max(1)) for k in ks]
