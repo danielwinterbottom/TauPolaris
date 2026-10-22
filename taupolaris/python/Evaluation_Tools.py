@@ -2,14 +2,60 @@ import torch
 from tqdm import tqdm
 import numpy as np
 from taupolaris.utils.kinematic_helpers import polarimetric_vector_tau, compute_spin_angles, boost_vector, boost, compute_spin_density_vars
-from taupolaris.utils.coordinate_conversions import ConvertFromOrthonormalNRK_Predictions, convert_coordinates_pred
+from taupolaris.utils.coordinate_conversions import ConvertFromOrthonormalNRK_Predictions, convert_coordinates_pred, ConvertToOrthonormalNRK
+import pandas as pd
 import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
+from matplotlib.ticker import MultipleLocator
 from iminuit import Minuit
 import time
+
+
+import mplhep as hep
+plt.style.use(hep.style.CMS)
+plt.rcParams.update({"font.size": 18, "axes.labelsize": 18, "xtick.labelsize": 18, "ytick.labelsize": 18, "legend.fontsize": 18})
+
+
+# fixed tick spacing for _plot_pdf, applied to every PDF plot regardless of its data range
+pdf_x_tick_step = 1.0
+pdf_y_tick_step = 0.2
+
+
+truth_color = "#EE8A3D" # '#C9B583'
+sampled_color = '#0072B2'
+pred_color = "#e42536" #'#CC3311'
+transformer_color = '#2CA02C'
+# truth_line_color = '#CC5801'
+
+
+# Pretty x-axis labels for _plot_pdf, keyed by the raw feature name. Falls
+# back to the raw name itself for anything not listed here (e.g. leptonic
+# tau1/tau2 cartesian components, which reuse the taup/taun cart_features
+# list further down and so aren't covered by name).
+pretty_labels = {
+    # hadronic onorm (taup/taun)
+    # 'taup_nu_n': r"$\bar{\nu_\tau}$ ($n$ component)", 'taup_nu_r': r"$\bar{\nu_\tau}$ ($r$ component)", 'taup_nu_k': r"$\bar{\nu_\tau}$ ($k$ component)",
+    # 'taun_nu_n': r"$\nu_\tau$ ($n$ component)", 'taun_nu_r': r"$\nu_\tau$ ($r$ component)", 'taun_nu_k': r"$\nu_\tau$ ($k$ component)",
+
+    # 'taup_nu_n': r"$\mathbf{\nu}_{\mathbf{\tau}_{\mathbf{1}}}$ ($\mathbf{n}_{\mathbf{1}}$ component)", 'taup_nu_r': r"$\mathbf{\nu}_{\mathbf{\tau}_{\mathbf{1}}}$ ($\mathbf{r}_{\mathbf{1}}$ component)", 'taup_nu_k': r"$\mathbf{\nu}_{\mathbf{\tau}_{\mathbf{1}}}$ ($\mathbf{k}_{\mathbf{1}}$ component)",
+    # 'taun_nu_n': r"$\mathbf{\nu}_{\mathbf{\tau}_{\mathbf{2}}}$ ($\mathbf{n}_{\mathbf{2}}$ component)", 'taun_nu_r': r"$\mathbf{\nu}_{\mathbf{\tau}_{\mathbf{2}}}$ ($\mathbf{r}_{\mathbf{2}}$ component)", 'taun_nu_k': r"$\mathbf{\nu}_{\mathbf{\tau}_{\mathbf{2}}}$ ($\mathbf{k}_{\mathbf{2}}$ component)",
+
+    'taup_nu_n': r"${\nu}_{{\tau}_{{1}}}$ (${n}_{{1}}$ component)", 'taup_nu_r': r"${\nu}_{{\tau}_{{1}}}$ (${r}_{{1}}$ component)", 'taup_nu_k': r"${\nu}_{{\tau}_{{1}}}$ (${k}_{{1}}$ component)",
+    'taun_nu_n': r"${\nu}_{{\tau}_{{2}}}$ (${n}_{{2}}$ component)", 'taun_nu_r': r"${\nu}_{{\tau}_{{2}}}$ (${r}_{{2}}$ component)", 'taun_nu_k': r"${\nu}_{{\tau}_{{2}}}$ (${k}_{{2}}$ component)",
+
+    # semileptonic onorm (tau1/tau2)
+    'tau1_nu_m': r"$\nu\nu_{\tau_1}$ (mass)",
+    'tau1_nu_n': r"$\nu_{\tau_1}$ ($n$ component)", 'tau1_nu_r': r"$\nu_{\tau_1}$ ($r$ component)", 'tau1_nu_k': r"$\nu_{\tau_1}$ ($k$ component)",
+    'tau2_nu_n': r"$\nu_{\tau_2}$ ($n$ component)", 'tau2_nu_r': r"$\nu_{\tau_2}$ ($r$ component)", 'tau2_nu_k': r"$\nu_{\tau_2}$ ($k$ component)",
+    # cartesian neutrino momenta
+    'taup_nu_px': r"$\bar{\nu_\tau}$ ($p_x$ component)", 'taup_nu_py': r"$\bar{\nu_\tau}$ ($p_y$ component)", 'taup_nu_pz': r"$\bar{\nu_\tau}$ ($p_z$ component)",
+    'taun_nu_px': r"$\nu_\tau$ ($p_x$ component)", 'taun_nu_py': r"$\nu_\tau$ ($p_y$ component)", 'taun_nu_pz': r"$\nu_\tau$ ($p_z$ component)",
+    # neutrino energy
+    'taup_nu_E': r"$\bar{\nu_\tau}$ (energy) [GeV]", 'taun_nu_E': r"$\nu_\tau$ (energy) [GeV]",
+}
 
 def flow_map_predict(
     model,
@@ -183,8 +229,15 @@ def flow_map_predict(
             #final_log_p = log_p.mean().item()
             #print(f"Initial mean log p: {initial_log_p:.6f}, Final mean log p: {final_log_p:.6f}, Gain: {final_log_p - initial_log_p:.6f}")
 
+            # final evaluation at the post-update z, so x_map and log_p are in sync
+            # (log_p inside the loop is computed *before* that step's optimizer.step(),
+            # so using it directly here would be one step stale relative to x_map)
+            with torch.no_grad():
+                x_map, logabsdet = model.flow._transform.inverse(z, context=cond_embed_chunk)
+                log_p = -0.5 * (z ** 2).sum(dim=-1) - logabsdet
+
             if return_log_prob:
-                all_best_log_probs.append(log_p.detach().cpu())
+                all_best_log_probs.append(log_p.cpu())
 
             with torch.no_grad():
                 x_map, _ = model.flow._transform.inverse(z.detach(), context=cond_embed_chunk)
@@ -453,7 +506,7 @@ def save_sampled_pdfs(
         bins = np.linspace(lower_bound, upper_bound, n_bins)
 
         pred_i = predictions[:, i]
-        plt.figure(figsize=(6, 4))
+        plt.figure(figsize=(8, 6))
         plt.hist(pred_i, bins=bins, density=True, histtype='step', linewidth=2)
         # draw true value as an arrow
         true_value = dataset.destandardize_outputs(y[event_number].unsqueeze(0)).cpu().numpy()[0, i]
@@ -486,26 +539,44 @@ def save_sampled_pdfs(
 
         plt.xlabel(v)
         plt.ylabel("pdf (sampled)")
-        plt.title(f"Sampled p({v} | context of event {event_number})")
+        # plt.title(f"Sampled p({v} | context of event {event_number})")
         plt.tight_layout()
         plt.savefig(os.path.join(outdir, f"event{event_number}_{v}.pdf"))
         plt.close()
 
-def _plot_pdf(v_pred, true_val, map_val, label, outdir, event_number, bins, clip, xlabel=None):
+def _plot_pdf(v_pred, true_val, map_val, label, outdir, event_number, bins, clip, xlabel=None, map_val2=None, transformer_val=None):
     if xlabel is None:
-        xlabel = label
+        xlabel = pretty_labels.get(label, label)
     bins = np.linspace(np.percentile(v_pred, 0.1), np.percentile(v_pred, 99.9), bins) if clip else bins
     plt.figure(figsize=(6, 4))
-    plt.hist(v_pred, bins=bins, density=True, histtype='step', linewidth=2)
-    plt.axvline(true_val, color='r', linestyle='--', linewidth=2, label='True value')
+    plt.axvline(true_val, color=truth_color, linestyle='solid', linewidth=2, label='True value')
+    weight = np.ones_like(v_pred) / len(v_pred)
+    counts, _, _ = plt.hist(v_pred, bins=bins, weights=weight, histtype='step', linewidth=2, color=sampled_color, label='TauPolaris (sampled)')
     if map_val is not None:
-        plt.axvline(map_val, color='orange', linestyle='--', linewidth=2, label='MAP estimate')
-    plt.legend()
+        plt.axvline(map_val, color=pred_color, linestyle='solid', linewidth=2, label='TauPolaris (MAP)')
+    # if map_val2 is not None:
+    #     plt.axvline(map_val2, color=map2_color, linestyle=':', linewidth=2, label='TauPolaris (stochastic mode)')
+    if transformer_val is not None:
+        plt.axvline(transformer_val, color=transformer_color, linestyle='solid', linewidth=2, label='Transformer')
+    ax = plt.gca()
+    _, ymax = ax.get_ylim()
+    ax.set_ylim(top=max(ymax, counts.max() * 1.15))
+
+    # LUCAS uncomment
+    ax.xaxis.set_major_locator(MultipleLocator(pdf_x_tick_step))
+    # ax.yaxis.set_major_locator(MultipleLocator(pdf_y_tick_step))
+    if "nu_n" in label:
+        plt.xlim(-2.2, 2.2)
+    elif "nu_r" in label:
+        plt.xlim(-2.6, 2.6)
+
+
+    plt.legend(loc='lower center', bbox_to_anchor=(0.5, 0.96), ncol=2, frameon=False)
     plt.xlabel(xlabel)
-    plt.ylabel("pdf (sampled)")
-    plt.title(f"Sampled p({label} | context), event {event_number}")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"event{event_number}_{label}.pdf"))
+    plt.ylabel("Normalized counts")
+    # plt.title(f"Sampled p({label} | context), event {event_number}")
+    # plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f"event{event_number}_{label}.pdf"), bbox_inches='tight')
     plt.close()
 
 
@@ -519,6 +590,8 @@ def save_sampled_pdfs_LHC(
     bins=100,
     outdir="pdf_slices_sampled",
     map_value=None,
+    map_value2=None,
+    transformer_value=None,
     df=None,
     coordinates='onorm',
     leptonic_mode=0,
@@ -530,13 +603,27 @@ def save_sampled_pdfs_LHC(
     coordinate space of the model (e.g. n/r/k for onorm).
 
     map_value : np.ndarray of shape [n_output_features], optional
-        MAP estimate in the same destandardized coordinate space as the samples.
-        If provided, overlaid as an orange dashed line on each plot.
+        MAP estimate (gradient method) in the same destandardized coordinate space
+        as the samples. If provided, overlaid as an orange dashed line on each plot.
+    map_value2 : np.ndarray of shape [n_output_features], optional
+        Alternative MAP estimate (stochastic/maximum-sampling method), in the same
+        destandardized coordinate space. If provided, overlaid as a purple dotted
+        line on each plot.
+    transformer_value : np.ndarray of shape [6], optional
+        Transformer prediction for [taup_nu_px, taup_nu_py, taup_nu_pz, taun_nu_px,
+        taun_nu_py, taun_nu_pz], in physical Cartesian neutrino-momentum space.
+        If provided, overlaid as a green dash-dot line on the regressed-neutrino
+        (Cartesian) plots directly, and also on the train_coords plots after
+        converting into the model's native onorm (n/r/k) basis (requires df and
+        coordinates=='onorm' — otherwise it's only shown on the Cartesian plots).
     df : pd.DataFrame, optional
         Test dataframe with visible tau decay products. If provided, also produces
         Cartesian (px,py,pz) and energy plots after converting from native coordinates.
     """
-    os.makedirs(outdir, exist_ok=True)
+    train_coords_dir = os.path.join(outdir, "train_coords")
+    regressed_neutrinos_dir = os.path.join(outdir, "regressed_neutrinos")
+    os.makedirs(train_coords_dir, exist_ok=True)
+    os.makedirs(regressed_neutrinos_dir, exist_ok=True)
     model.eval()
 
     X = dataset.X[event_number].unsqueeze(0).to(device)
@@ -550,14 +637,13 @@ def save_sampled_pdfs_LHC(
 
     if clip==True:
         print("WARNING: This script clips 0.1% outliers on variables by default")
-    for i, v in enumerate(output_features):
-        _plot_pdf(predictions[:, i], true_values[i],
-                  map_value[i] if map_value is not None else None,
-                  v, outdir, event_number, bins, clip)
 
-    # plot cartesian components and energy
-    if df is not None and coordinates!='standard':
-        print('recomputing 4 components in cartesian')
+    # Recover the visible tau decay products needed to build the onorm (n/r/k) basis
+    # and to convert to Cartesian — shared by the train_coords transformer overlay
+    # below and the regressed-neutrino Cartesian plots further down.
+    tau1_prefix = tau2_prefix = reco_taup_charged = reco_taun_charged = None
+    reco_taup_pizero = reco_taun_pizero = None
+    if df is not None and coordinates != 'standard':
         tau1_prefix = 'taup' if 'taup_nu_px' in df.columns else 'tau1'
         tau2_prefix = 'taun' if tau1_prefix == 'taup' else 'tau2'
 
@@ -565,6 +651,56 @@ def save_sampled_pdfs_LHC(
         reco_taun_charged = df[[f'reco_{tau2_prefix}_charged_e', f'reco_{tau2_prefix}_charged_px', f'reco_{tau2_prefix}_charged_py', f'reco_{tau2_prefix}_charged_pz']].values[event_number:event_number+1]
         reco_taup_pizero = df[[f'reco_{tau1_prefix}_pizero1_e', f'reco_{tau1_prefix}_pizero1_px', f'reco_{tau1_prefix}_pizero1_py', f'reco_{tau1_prefix}_pizero1_pz']].values[event_number:event_number+1]
         reco_taun_pizero = df[[f'reco_{tau2_prefix}_pizero1_e', f'reco_{tau2_prefix}_pizero1_px', f'reco_{tau2_prefix}_pizero1_py', f'reco_{tau2_prefix}_pizero1_pz']].values[event_number:event_number+1]
+
+    transformer_value_onorm = None
+    if transformer_value is not None and reco_taup_charged is not None and coordinates == 'onorm':
+        onorm_df = pd.DataFrame({
+            f'{tau1_prefix}_nu_px': [transformer_value[0]],
+            f'{tau1_prefix}_nu_py': [transformer_value[1]],
+            f'{tau1_prefix}_nu_pz': [transformer_value[2]],
+            f'{tau2_prefix}_nu_px': [transformer_value[3]],
+            f'{tau2_prefix}_nu_py': [transformer_value[4]],
+            f'{tau2_prefix}_nu_pz': [transformer_value[5]],
+            f'reco_{tau1_prefix}_charged_px': reco_taup_charged[:, 1],
+            f'reco_{tau1_prefix}_charged_py': reco_taup_charged[:, 2],
+            f'reco_{tau1_prefix}_charged_pz': reco_taup_charged[:, 3],
+            f'reco_{tau1_prefix}_pizero1_px': reco_taup_pizero[:, 1],
+            f'reco_{tau1_prefix}_pizero1_py': reco_taup_pizero[:, 2],
+            f'reco_{tau1_prefix}_pizero1_pz': reco_taup_pizero[:, 3],
+            f'reco_{tau2_prefix}_charged_px': reco_taun_charged[:, 1],
+            f'reco_{tau2_prefix}_charged_py': reco_taun_charged[:, 2],
+            f'reco_{tau2_prefix}_charged_pz': reco_taun_charged[:, 3],
+            f'reco_{tau2_prefix}_pizero1_px': reco_taun_pizero[:, 1],
+            f'reco_{tau2_prefix}_pizero1_py': reco_taun_pizero[:, 2],
+            f'reco_{tau2_prefix}_pizero1_pz': reco_taun_pizero[:, 3],
+        })
+        onorm_df = ConvertToOrthonormalNRK(
+            onorm_df, prefix_to_convert=f'{tau1_prefix}_nu_',
+            charged_prefix=f'reco_{tau1_prefix}_charged_',
+            pi0_prefix=f'reco_{tau1_prefix}_pizero1_',
+            drop_xyz=False,
+        )
+        onorm_df = ConvertToOrthonormalNRK(
+            onorm_df, prefix_to_convert=f'{tau2_prefix}_nu_',
+            charged_prefix=f'reco_{tau2_prefix}_charged_',
+            pi0_prefix=f'reco_{tau2_prefix}_pizero1_',
+            drop_xyz=False,
+        )
+        onorm_row = onorm_df.iloc[0]
+        transformer_value_onorm = np.array(
+            [onorm_row[feat] if feat in onorm_row else None for feat in output_features]
+        )
+
+    for i, v in enumerate(output_features):
+        _plot_pdf(predictions[:, i], true_values[i],
+                  map_value[i] if map_value is not None else None,
+                  v, train_coords_dir, event_number, bins, clip,
+                  map_val2=map_value2[i] if map_value2 is not None else None,
+                  transformer_val=transformer_value_onorm[i] if transformer_value_onorm is not None else None)
+
+    # plot cartesian components and energy
+    if df is not None and coordinates!='standard':
+        print('recomputing 4 components in cartesian')
 
         single_kwargs = dict(coordinates=coordinates, output_features=output_features,
                              tau1_charged=reco_taup_charged, tau1_pi0=reco_taup_pizero,
@@ -581,6 +717,7 @@ def save_sampled_pdfs_LHC(
         pred_cart = convert_coordinates_pred(predictions, **pred_conv_kwargs)
         true_cart = convert_coordinates_pred(true_values[np.newaxis, :], **single_kwargs)[0]
         map_cart = convert_coordinates_pred(map_value[np.newaxis, :], **single_kwargs)[0] if map_value is not None else None
+        map_cart2 = convert_coordinates_pred(map_value2[np.newaxis, :], **single_kwargs)[0] if map_value2 is not None else None
 
         cart_features = ['taup_nu_px', 'taup_nu_py', 'taup_nu_pz','taun_nu_px', 'taun_nu_py', 'taun_nu_pz']
         nu_p_slices = {'taup_nu': (0, 3), 'taun_nu': (3, 6)}
@@ -589,15 +726,19 @@ def save_sampled_pdfs_LHC(
         for i, v in enumerate(cart_features):
             _plot_pdf(pred_cart[:, i], true_cart[i],
                       map_cart[i] if map_cart is not None else None,
-                      v, outdir, event_number, bins, clip)
+                      v, regressed_neutrinos_dir, event_number, bins, clip,
+                      map_val2=map_cart2[i] if map_cart2 is not None else None,
+                      transformer_val=transformer_value[i] if transformer_value is not None else None)
 
         # plot energy
         for nu_name, (s, e) in nu_p_slices.items():
             E_pred = np.sqrt(np.sum(pred_cart[:, s:e]**2, axis=1))
             E_true = np.sqrt(np.sum(true_cart[s:e]**2))
             E_map = np.sqrt(np.sum(map_cart[s:e]**2)) if map_cart is not None else None
-            _plot_pdf(E_pred, E_true, E_map, f'{nu_name}_E', outdir, event_number, bins, clip,
-                      xlabel=f'{nu_name}_E [GeV]')
+            E_map2 = np.sqrt(np.sum(map_cart2[s:e]**2)) if map_cart2 is not None else None
+            E_transformer = np.sqrt(np.sum(transformer_value[s:e]**2)) if transformer_value is not None else None
+            _plot_pdf(E_pred, E_true, E_map, f'{nu_name}_E', regressed_neutrinos_dir, event_number, bins, clip,
+                      map_val2=E_map2, transformer_val=E_transformer)
 
 
 
