@@ -287,7 +287,14 @@ def load_svfit_predictions(df, svfit_path):
             raise ValueError(f"{col} differs between the SVfit file and the main input — they are not row-aligned.")
     df = df.copy()
     for col in pred_cols:
-        df[col.replace("pred_SVfit_", "svfit_pred_")] = svfit_df[col].values
+        vals = svfit_df[col].values
+        if col.endswith("_E"):
+            # SVfit can return unphysical negative (neutrino) energies; set them to 0
+            n_negative = int((vals < 0).sum())
+            if n_negative:
+                print(f">> Setting {n_negative} negative {col} values to 0")
+            vals = np.where(vals < 0, 0.0, vals)  # keeps NaN for failed fits
+        df[col.replace("pred_SVfit_", "svfit_pred_")] = vals
     n_failed = int((~svfit_df["svfit_valid"].values.astype(bool)).sum())
     print(f">> {n_failed} of {len(df)} events have no valid SVfit fit; they are left out of the SVfit curves only")
     return df
