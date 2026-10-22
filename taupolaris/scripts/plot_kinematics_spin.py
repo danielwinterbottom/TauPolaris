@@ -123,8 +123,8 @@ angle_pairs = (
 # Constants and styling
 # ---------------------------------------------------------------------------
 
-# column prefixes for truth, MAP prediction, sampled prediction and transformer prediction
-prefixes = ("true_", "map_pred_", "pred_", "transformer_pred_")
+# column prefixes for truth, MAP prediction, sampled prediction, transformer and SVfit predictions
+prefixes = ("true_", "map_pred_", "pred_", "transformer_pred_", "svfit_pred_")
 
 m_tau = 1.77686
 m_boson = 125.0
@@ -134,9 +134,11 @@ truth_alpha = 0.6
 sampled_color = '#0072B2'
 pred_color = "#e42536"
 transformer_color = '#2CA02C'
+svfit_color = '#9467BD'
 
 # overlay key -> (color, legend label)
 overlay_styles = {
+    "svfit":       (svfit_color, "SVfit"),
     "transformer": (transformer_color, "Transformer"),
     "sampled":     (sampled_color, "TauPolaris (sampled)"),
     "map":         (pred_color, "TauPolaris (MAP)"),
@@ -267,6 +269,30 @@ def load_transformer_predictions(df, transformer_path):
     return df
 
 
+def load_svfit_predictions(df, svfit_path):
+    """Attach SVfit predictions from an evaluate_svfit.py output file (pred_SVfit_* columns,
+    row-aligned with df) under a svfit_pred_ prefix. Failed SVfit fits keep their NaN predictions:
+    the SVfit curves skip those events, while every other curve still uses all events."""
+    svfit_df = pd.read_parquet(svfit_path)
+    pred_cols = [f"pred_SVfit_{var}" for var in list(pred_taunu_vars) + list(spin_vars) if f"pred_SVfit_{var}" in svfit_df.columns]
+    check_cols = [c for c in ("true_nu_px", "true_nubar_px") if c in svfit_df.columns and c in df.columns]
+    if len(svfit_df) != len(df):
+        raise ValueError(
+            f"SVfit predictions file has {len(svfit_df)} rows, "
+            f"but the main input has {len(df)} rows — they must be row-aligned."
+        )
+    # the SVfit results come from a separate script, so check the events really line up
+    for col in check_cols:
+        if not np.allclose(svfit_df[col].values, df[col].values, equal_nan=True):
+            raise ValueError(f"{col} differs between the SVfit file and the main input — they are not row-aligned.")
+    df = df.copy()
+    for col in pred_cols:
+        df[col.replace("pred_SVfit_", "svfit_pred_")] = svfit_df[col].values
+    n_failed = int((~svfit_df["svfit_valid"].values.astype(bool)).sum())
+    print(f">> {n_failed} of {len(df)} events have no valid SVfit fit; they are left out of the SVfit curves only")
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Weighted statistics (weights=None means unweighted)
 # ---------------------------------------------------------------------------
@@ -311,15 +337,24 @@ def _count_norm_weights(n_events, weights=None):
 def _overlays(df, var, use_map, index=None):
     """[(style key, values)] of the extra predictions to overlay, in draw order.
     The sampled prediction is only overlaid when the main line is the MAP
-    estimate; otherwise the main line already is pred_*, so it would be a duplicate."""
+    estimate; otherwise the main line already is pred_*, so it would be a duplicate.
+    Each overlay keeps only its non-NaN events (SVfit is NaN for failed fits), so the
+    drawing functions normalise every curve over its own events."""
     overlays = []
+    if f"svfit_pred_{var}" in df.columns:
+        overlays.append(("svfit", df[f"svfit_pred_{var}"]))
     if f"transformer_pred_{var}" in df.columns:
         overlays.append(("transformer", df[f"transformer_pred_{var}"]))
     if use_map and f"pred_{var}" in df.columns:
         overlays.append(("sampled", df[f"pred_{var}"]))
     if index is not None:
         overlays = [(key, vals.loc[index]) for key, vals in overlays]
-    return overlays
+    return [(key, vals.dropna()) for key, vals in overlays]
+
+
+def _weights_for(vals, weights=None):
+    """Per-event weights matching vals' events (None if unweighted)."""
+    return weights.loc[vals.index] if weights is not None else None
 
 
 def _save(fig, path):
@@ -329,24 +364,25 @@ def _save(fig, path):
 
 def _draw_resolution(ax_res, true_vals, main_vals, overlays, label, weights=None):
     """Per-event (pred - truth) histograms for the main prediction and each overlay."""
-    w = weights.loc[true_vals.index] if weights is not None else None
-    hist_w = _count_norm_weights(len(true_vals), w)
-    # predictions are never NaN, so they always cover true_vals' index
+    # the main prediction is never NaN, so it covers true_vals' index; overlays may cover fewer
+    # events (SVfit failed fits), so each diff only keeps the events where both values exist
     diff_main = main_vals.loc[true_vals.index] - true_vals
-    diffs = [(key, vals.loc[true_vals.index] - true_vals) for key, vals in overlays]
+    diffs = [(key, (vals - true_vals).dropna()) for key, vals in overlays]
+    all_diffs = diffs + [("map", diff_main)]
 
-    combined_diff = pd.concat([diff_main] + [d for _, d in diffs])
-    if w is not None:
-        combined_weight = pd.concat([w] * (len(diffs) + 1))
+    combined_diff = pd.concat([d for _, d in all_diffs])
+    if weights is not None:
+        combined_weight = pd.concat([_weights_for(d, weights) for _, d in all_diffs])
         bin_range = (_weighted_quantile(combined_diff, combined_weight, 0.01),
                      _weighted_quantile(combined_diff, combined_weight, 0.99))
     else:
         bin_range = (combined_diff.quantile(0.01), combined_diff.quantile(0.99))
     diff_bins = np.histogram_bin_edges(combined_diff, bins=50, range=bin_range)
 
-    for key, diff in diffs + [("map", diff_main)]:
+    for key, diff in all_diffs:
         color, name = overlay_styles[key]
-        ax_res.hist(diff, bins=diff_bins, histtype="step", weights=hist_w, linewidth=2, color=color,
+        w = _weights_for(diff, weights)
+        ax_res.hist(diff, bins=diff_bins, histtype="step", weights=_count_norm_weights(len(diff), w), linewidth=2, color=color,
                     label=fr"{name}: $\mu$={_weighted_mean(diff, w):.2f}, IQR={_iqr(diff, w):.2f}")
 
     ax_res.set_xlabel(f"{label} Resolution (Pred. - Truth)")
@@ -379,8 +415,10 @@ def _draw_distribution_ratio(ax, ax_ratio, true_vals, overlays, bins, weights=No
 
     for key, vals in overlays:
         color, name = overlay_styles[key]
-        ax.hist(vals, bins=bins, histtype="step", weights=hist_w, linewidth=2, color=color, label=name)
-        overlay_hist, _ = np.histogram(vals, bins=bins, weights=hist_w)
+        # normalised over this overlay's own events (fewer than truth for SVfit)
+        overlay_w = _count_norm_weights(len(vals), _weights_for(vals, weights))
+        ax.hist(vals, bins=bins, histtype="step", weights=overlay_w, linewidth=2, color=color, label=name)
+        overlay_hist, _ = np.histogram(vals, bins=bins, weights=overlay_w)
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio = np.where(true_hist > 0, overlay_hist / true_hist, np.nan)
         ax_ratio.stairs(ratio, bins, linewidth=2, color=color)
@@ -469,7 +507,7 @@ def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None):
         ax.axvline(truth_val, color=truth_color, linestyle="solid", linewidth=2, label="Generator Truth")
         for key, vals in overlays:
             color, name = overlay_styles[key]
-            ax.hist(vals, bins=bins, histtype="step", weights=_count_norm_weights(len(vals), weights),
+            ax.hist(vals, bins=bins, histtype="step", weights=_count_norm_weights(len(vals), _weights_for(vals, weights)),
                     linewidth=2, color=color, label=name)
         ax.set_xlabel(label)
         ax.set_ylabel("Normalized counts")
@@ -496,6 +534,10 @@ def main():
                         help="Path to a second parquet file with transformer predictions "
                              "(same pred_* column naming as the sampled predictions, row-aligned "
                              "with --input); overlaid as a green line if given")
+    parser.add_argument('--svfit_input', type=str, default=None,
+                        help="Path to an evaluate_svfit.py output parquet (pred_SVfit_* columns, row-aligned "
+                             "with --input); overlaid as a purple line if given. Events with a failed "
+                             "SVfit fit are left out of the SVfit curves only")
     parser.add_argument('--sampled', action='store_true',
                         help="Use the sampled prediction (pred_*) as the main line instead of the MAP estimate")
     parser.add_argument('--useMLP', action='store_true', help=argparse.SUPPRESS)  # old alias for --sampled
@@ -511,6 +553,9 @@ def main():
     if args.transformer_input:
         df = load_transformer_predictions(df, args.transformer_input)
         print(f">> Loaded transformer predictions from {args.transformer_input}")
+    if args.svfit_input:
+        df = load_svfit_predictions(df, args.svfit_input)
+        print(f">> Loaded SVfit predictions from {args.svfit_input}")
     if args.weight and args.weight not in df.columns:
         raise ValueError(f"--weight column '{args.weight}' not found in input parquet")
     df = add_all_derived_cols(df)
