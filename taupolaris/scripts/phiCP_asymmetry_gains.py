@@ -1,6 +1,6 @@
 """Per-channel phiCP asymmetry gain of TauPolaris over the approximate (Run-3) methods, and its mean over channels,
 from the logs/DM*_<tag>.npz histograms written by plot_phiCP.py. The asymmetry is plot_phiCP.py's:
-sqrt(sum_bins (odd - even)^2) of the normalised CP-odd and CP-even phiCP histograms; gain = A_nu / A_run3 - 1.
+sqrt(sum_bins (odd - even)^2) of the CP-odd and CP-even phiCP histograms, each normalised to unit sum; gain = A_nu / A_run3 - 1.
 Several TauPolaris inputs can be compared against the same Run-3 reference.
 
     python taupolaris/scripts/phiCP_asymmetry_gains.py --run3 <phiCP dir>/logs \\
@@ -15,8 +15,10 @@ import pandas as pd
 
 
 def asym(path):
+    # each histogram normalised to unit sum: older logs (e.g. the paper's) store densities, i.e. /bin width
     d = np.load(path)
-    return float(np.sqrt(((d['odd_counts'] - d['even_counts']) ** 2).sum()))
+    even, odd = d['even_counts'] / d['even_counts'].sum(), d['odd_counts'] / d['odd_counts'].sum()
+    return float(np.sqrt(((odd - even) ** 2).sum()))
 
 
 def main():
