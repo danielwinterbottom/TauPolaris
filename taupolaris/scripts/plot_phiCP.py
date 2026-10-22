@@ -5,6 +5,7 @@ from matplotlib.legend_handler import HandlerPatch
 from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 import pandas as pd
+import pyarrow.parquet as pq
 import mplhep as hep
 import numpy as np
 import awkward as ak
@@ -349,9 +350,22 @@ def compute_vis_pt(df, prefix):
     return np.sqrt((taup_px + taun_px)**2 + (taup_py + taun_py)**2)
 
 
-def load_data(prefix='', extra_pt_cut=-1, uncorrelated=False):
+# The columns this script reads (traced through main() for gen / recoNu / recoRun3, both channels); the generator decay
+# columns true_taup_* / true_taun_* are added for the TauSpinner options and --GENfilter. Reading only these keeps the
+# full hadronic results file (3.4M events, ~250 columns) within a 16 GB login-node session.
+_COLUMN_PREFIXES = ('map_pred_tau_', 'pred_tau_', 'true_tau_', 'reco_taup_', 'reco_taun_', 'tauspinner_wt_', 'FastMTT_')
+_COLUMNS = ('taup_DM', 'taun_DM', 'pred_phiCP')
+
+
+def read_needed_columns(path, with_true_decays=False):
+    prefixes = _COLUMN_PREFIXES + (('true_taup_', 'true_taun_') if with_true_decays else ())
+    names = pq.ParquetFile(path).schema_arrow.names
+    return pd.read_parquet(path, columns=[c for c in names if c.startswith(prefixes) or c in _COLUMNS])
+
+
+def load_data(prefix='', extra_pt_cut=-1, uncorrelated=False, with_true_decays=False):
     cfg = options['files']
-    read = pd.read_parquet
+    read = lambda path: read_needed_columns(path, with_true_decays)
 
     if uncorrelated:
         uncorr_df = read(cfg[f'{prefix}uncorr'])
@@ -421,19 +435,20 @@ def main():
     prefix = 'sl_' if args.leptonic_mode == 1 else ''
     use_map = not args.useMLP
     dm_pfx = 'true' if args.GENfilter else 'reco'
+    with_true_decays = args.option.endswith('_ts') or args.GENfilter
 
     if args.input is not None:
         if not args.uncorrelated:
             parser.error('--input needs --uncorrelated')
         options['files'][f'{prefix}uncorr'] = args.input
     if args.uncorrelated:
-        uncorr_df = load_data(prefix=prefix, uncorrelated=True)
+        uncorr_df = load_data(prefix=prefix, uncorrelated=True, with_true_decays=with_true_decays)
         uncorr_df = add_or_get_DM(uncorr_df, dm_prefix=dm_pfx)
         uncorr_df = compute_phicp_all(uncorr_df, args.option, use_map=use_map, output_dir=args.output_dir)
         even_df = odd_df = mix_df = uncorr_df
         zprime_df = None
     else:
-        even_df, odd_df, mix_df, zprime_df = load_data(prefix=prefix)
+        even_df, odd_df, mix_df, zprime_df = load_data(prefix=prefix, with_true_decays=with_true_decays)
         even_df = add_or_get_DM(even_df, dm_prefix=dm_pfx)
         odd_df = add_or_get_DM(odd_df, dm_prefix=dm_pfx)
         even_df = compute_phicp_all(even_df, args.option, use_map=use_map, output_dir=args.output_dir)
