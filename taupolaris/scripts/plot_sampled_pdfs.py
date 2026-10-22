@@ -7,6 +7,7 @@ import pandas as pd
 from taupolaris.python.NN_Tools import load_model
 from taupolaris.python.DataProcessing import get_test_dataset
 from taupolaris.python.Evaluation_Tools import save_sampled_pdfs_LHC, flow_map_predict
+from taupolaris.scripts.plot_phiCP import add_or_get_DM
 import matplotlib.pyplot as plt
 import mplhep as hep
 plt.style.use(hep.style.CMS)
@@ -74,6 +75,7 @@ def main():
     data_config['test_dataset'] = data_config['test_dataset'] if not isinstance(data_config['test_dataset'], list) else data_config['test_dataset'][0]
     data_config['test_output_name'] = args.output_name
     test_dataset, test_df, _, _ = get_test_dataset(data_config, norm_data, oneprong=False)
+    test_df = add_or_get_DM(test_df, dm_prefix='reco')
 
     outdir = f"{output_dir}/pdf_slices_sampled_{args.output_name}"
     os.makedirs(outdir, exist_ok=True)
@@ -123,6 +125,9 @@ def main():
 
     for i, event_number in enumerate(args.events):
         print(f"  Sampling event {event_number}...")
+        # DM codes as in plot_phiCP.add_DM: 0/1/2/10/11 hadronic, 100 leptonic, -1 undefined
+        print(f"    taup DM = {test_df['taup_DM'].iloc[event_number]}, "
+              f"taun DM = {test_df['taun_DM'].iloc[event_number]}")
 
         map_value = None
         map_value2 = None
