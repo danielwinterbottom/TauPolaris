@@ -1,6 +1,6 @@
 """2D per-event resolution plots (prediction vs truth) for the variables in
-plot_kinematics_spin.py, with one panel per prediction: MAP, sampled, and
-transformer / SVfit if --transformer_input / --svfit_input are given."""
+plot_kinematics_spin.py, with one panel per prediction: MAP, sampled, and stable MAP /
+transformer / SVfit if --stable_map_input / --transformer_input / --svfit_input are given."""
 import argparse
 import os
 
@@ -11,8 +11,9 @@ import matplotlib.pyplot as plt
 # also sets up the matplotlib backend and CMS style
 from plot_kinematics_spin import (
     spin_vars, kinematic_vars, spin_density_vars, derived_vars, angle_vars,
-    overlay_styles, load_transformer_predictions, load_svfit_predictions, add_all_derived_cols,
-    _var_bins, _weights_for,
+    overlay_styles, load_transformer_predictions, load_svfit_predictions, load_stable_map_predictions,
+    add_all_derived_cols,
+    add_map_nu_E_cut_args, select_events, output_subdir, _var_bins, _weights_for,
 )
 
 
@@ -32,7 +33,7 @@ vmax_percentile = 99
 def _panels(df, var, index):
     """[(style key, values)] for each available prediction, aligned to index.
     Each panel keeps only its non-NaN events (SVfit is NaN for failed fits)."""
-    cols = (("map", f"map_pred_{var}"), ("sampled", f"pred_{var}"),
+    cols = (("map", f"map_pred_{var}"), ("stable_map", f"stable_map_pred_{var}"), ("sampled", f"pred_{var}"),
             ("transformer", f"transformer_pred_{var}"), ("svfit", f"svfit_pred_{var}"))
     return [(key, df[col].loc[index].dropna()) for key, col in cols if col in df.columns]
 
@@ -56,7 +57,7 @@ def _conditional_hist(true_vals, pred_vals, bins, weights=None):
         return h / h.sum(axis=1, keepdims=True)
 
 
-def plot_2d_vars(df, var_dict, out_dir, bounded, weights=None):
+def plot_2d_vars(df, var_dict, out_dir, bounded, weights=None, note=None):
     for var, label in var_dict.items():
         true_col = f"true_{var}"
         if true_col not in df.columns or f"map_pred_{var}" not in df.columns:
@@ -87,8 +88,10 @@ def plot_2d_vars(df, var_dict, out_dir, bounded, weights=None):
             mesh = ax.pcolormesh(bins, bins, h.T, cmap=cmap, vmin=0, vmax=vmax, rasterized=True)
             ax.plot(bins[[0, -1]], bins[[0, -1]], color="gray", linestyle="dashed", linewidth=1.5)
             ax.set_title(overlay_styles[key][1], fontsize=18)
-            ax.text(0.05, 0.93, f"r = {r:.3f}", transform=ax.transAxes,
-                    fontsize=16, bbox=dict(facecolor="white", alpha=0.8, edgecolor="none"))
+            box = dict(facecolor="white", alpha=0.8, edgecolor="none")
+            ax.text(0.05, 0.93, f"r = {r:.3f}", transform=ax.transAxes, fontsize=16, bbox=box)
+            if note:
+                ax.text(0.05, 0.85, note, transform=ax.transAxes, fontsize=16, bbox=box)
             ax.set_xlabel(f"True {label}")
             ax.set_xlim(bins[0], bins[-1])
             ax.set_ylim(bins[0], bins[-1])
@@ -111,9 +114,13 @@ def main():
                         help="Path to an evaluate_svfit.py output parquet (pred_SVfit_* columns, row-aligned "
                              "with --input); shown as an extra panel if given. Events with a failed "
                              "SVfit fit are left out of the SVfit panel only")
+    parser.add_argument('--stable_map_input', type=str, default=None,
+                        help="Path to an evaluate.py output run with map_method: stable_gradient "
+                             "(stable_map_pred_* columns, row-aligned with --input); shown as an extra panel if given")
     parser.add_argument('--tag', type=str, default='', help="Tag prepended to the output subdirectory name")
     parser.add_argument('--weight', type=str, default=None,
                         help="Name of a column in the input parquet to use as the per-event weight")
+    add_map_nu_E_cut_args(parser)
     args = parser.parse_args()
 
     df = pd.read_parquet(args.input)
@@ -124,17 +131,20 @@ def main():
     if args.svfit_input:
         df = load_svfit_predictions(df, args.svfit_input)
         print(f">> Loaded SVfit predictions from {args.svfit_input}")
+    if args.stable_map_input:
+        df = load_stable_map_predictions(df, args.stable_map_input)
+        print(f">> Loaded stable MAP predictions from {args.stable_map_input}")
     if args.weight and args.weight not in df.columns:
         raise ValueError(f"--weight column '{args.weight}' not found in input parquet")
+    df, cut_tag, note = select_events(df, args)
     df = add_all_derived_cols(df)
     weights = df[args.weight] if args.weight else None
 
-    subdir = f"{args.tag}_paper_plots" if args.tag else "paper_plots"
-    out_dir = os.path.join(args.input.replace('.parquet', ''), subdir, "2D")
+    out_dir = os.path.join(args.input.replace('.parquet', ''), output_subdir(args.tag, cut_tag), "2D")
     os.makedirs(out_dir, exist_ok=True)
 
     for var_dict, bounded in plot_groups:
-        plot_2d_vars(df, var_dict, out_dir, bounded, weights)
+        plot_2d_vars(df, var_dict, out_dir, bounded, weights, note)
 
 
 if __name__ == "__main__":

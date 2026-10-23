@@ -123,8 +123,8 @@ angle_pairs = (
 # Constants and styling
 # ---------------------------------------------------------------------------
 
-# column prefixes for truth, MAP prediction, sampled prediction, transformer and SVfit predictions
-prefixes = ("true_", "map_pred_", "pred_", "transformer_pred_", "svfit_pred_")
+# column prefixes for truth, MAP prediction, sampled prediction, transformer, SVfit and stable MAP predictions
+prefixes = ("true_", "map_pred_", "pred_", "transformer_pred_", "svfit_pred_", "stable_map_pred_")
 
 m_tau = 1.77686
 m_boson = 125.0
@@ -135,14 +135,18 @@ sampled_color = '#0072B2'
 pred_color = "#e42536"
 transformer_color = '#2CA02C'
 svfit_color = '#9467BD'
+stable_map_color = '#17BECF'
 
 # overlay key -> (color, legend label)
 overlay_styles = {
     "svfit":       (svfit_color, "SVfit"),
     "transformer": (transformer_color, "Transformer"),
+    "stable_map":  (stable_map_color, "TauPolaris (stable MAP)"),
     "sampled":     (sampled_color, "TauPolaris (sampled)"),
     "map":         (pred_color, "TauPolaris (MAP)"),
 }
+# MAP-type point estimates: like the main MAP line, shown in resolutions only (not distributions)
+resolution_only = ("stable_map",)
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +278,6 @@ def load_svfit_predictions(df, svfit_path):
     row-aligned with df) under a svfit_pred_ prefix. Failed SVfit fits keep their NaN predictions:
     the SVfit curves skip those events, while every other curve still uses all events."""
     svfit_df = pd.read_parquet(svfit_path)
-    pred_cols = [f"pred_SVfit_{var}" for var in list(pred_taunu_vars) + list(spin_vars) if f"pred_SVfit_{var}" in svfit_df.columns]
     check_cols = [c for c in ("true_nu_px", "true_nubar_px") if c in svfit_df.columns and c in df.columns]
     if len(svfit_df) != len(df):
         raise ValueError(
@@ -286,7 +289,19 @@ def load_svfit_predictions(df, svfit_path):
         if not np.allclose(svfit_df[col].values, df[col].values, equal_nan=True):
             raise ValueError(f"{col} differs between the SVfit file and the main input — they are not row-aligned.")
     df = df.copy()
-    for col in pred_cols:
+    for col, vals in svfit_prediction_cols(svfit_df).items():
+        df[col] = vals
+    return df
+
+
+def svfit_prediction_cols(svfit_df):
+    """{svfit_pred_* column: values} from an evaluate_svfit.py output's pred_SVfit_* columns.
+    Failed SVfit fits keep their NaN predictions."""
+    new = {}
+    for var in list(pred_taunu_vars) + list(spin_vars):
+        col = f"pred_SVfit_{var}"
+        if col not in svfit_df.columns:
+            continue
         vals = svfit_df[col].values
         if col.endswith("_E"):
             # SVfit can return unphysical negative (neutrino) energies; set them to 0
@@ -294,10 +309,82 @@ def load_svfit_predictions(df, svfit_path):
             if n_negative:
                 print(f">> Setting {n_negative} negative {col} values to 0")
             vals = np.where(vals < 0, 0.0, vals)  # keeps NaN for failed fits
-        df[col.replace("pred_SVfit_", "svfit_pred_")] = vals
+        new[f"svfit_pred_{var}"] = vals
     n_failed = int((~svfit_df["svfit_valid"].values.astype(bool)).sum())
-    print(f">> {n_failed} of {len(df)} events have no valid SVfit fit; they are left out of the SVfit curves only")
+    print(f">> {n_failed} of {len(svfit_df)} events have no valid SVfit fit; they are left out of the SVfit curves only")
+    return new
+
+
+def load_stable_map_predictions(df, stable_map_path):
+    """Attach stable MAP predictions (stable_map_pred_* columns, from evaluate.py with
+    map_method: stable_gradient) from a file row-aligned with df."""
+    stable_df = pd.read_parquet(stable_map_path)
+    if len(stable_df) != len(df):
+        raise ValueError(
+            f"Stable MAP predictions file has {len(stable_df)} rows, "
+            f"but the main input has {len(df)} rows — they must be row-aligned."
+        )
+    # produced by a separate evaluate.py run, so check the events really line up
+    for col in ("true_nu_px", "true_nubar_px"):
+        if col in stable_df.columns and col in df.columns and not np.allclose(stable_df[col].values, df[col].values, equal_nan=True):
+            raise ValueError(f"{col} differs between the stable MAP file and the main input — they are not row-aligned.")
+    df = df.copy()
+    for var in list(pred_taunu_vars) + list(spin_vars):
+        col = f"stable_map_pred_{var}"
+        if col in stable_df.columns:
+            df[col] = stable_df[col].values
     return df
+
+
+
+default_map_nu_E_cut = 5.0
+
+
+def apply_map_nu_E_cut(df, min_E, invert=False):
+    """Keep only events where the MAP prediction gives both neutrinos an energy above
+    min_E (GeV), removing the population of events with a near-zero MAP neutrino energy.
+    With invert, keep only that population instead (either neutrino at or below min_E)."""
+    cols = ["map_pred_nu_E", "map_pred_nubar_E"]
+    if not _has(df, *cols):
+        raise ValueError(f"MAP neutrino energy cut needs columns {cols} in the input parquet")
+    passed = (df[cols] > min_E).all(axis=1)
+    keep = ~passed if invert else passed
+    desc = f"E <= {min_E:g} GeV for either" if invert else f"E > {min_E:g} GeV for both"
+    print(f">> MAP neutrino energy cut ({desc}): kept {keep.sum()} of {len(df)} events")
+    return df[keep]
+
+
+def add_map_nu_E_cut_args(parser):
+    parser.add_argument('--map_nu_E_cut', type=float, nargs='?', const=default_map_nu_E_cut, default=None, metavar="GEV",
+                        help="Only use events where the MAP predicted energy of both neutrinos is above this "
+                             f"value (default {default_map_nu_E_cut:g} GeV if given without a value); applies to every curve/panel")
+    parser.add_argument('--invert_map_nu_E_cut', action='store_true',
+                        help="Invert the MAP neutrino energy cut: only use events where either neutrino's MAP "
+                             f"energy is at or below the cut (default {default_map_nu_E_cut:g} GeV if --map_nu_E_cut isn't given)")
+
+
+def select_events(df, args):
+    """Apply the MAP neutrino energy cut requested on the command line, if any.
+    Returns (df, cut_tag, note): cut_tag goes in the output folder name (e.g. mapNuE5 /
+    mapNuE5inv) so cut and uncut plots don't overwrite each other, and note is the bold
+    label drawn on every plot (None if no cut)."""
+    cut, invert = args.map_nu_E_cut, args.invert_map_nu_E_cut
+    if cut is None and invert:
+        cut = default_map_nu_E_cut
+    if cut is None:
+        return df, "", None
+    df = apply_map_nu_E_cut(df, cut, invert)
+    cut_tag = f"mapNuE{cut:g}" + ("inv" if invert else "")
+    if invert:
+        note = fr"$\mathbf{{MAP}}$ $\mathbf{{E_{{\nu}}\ or\ E_{{\bar{{\nu}}}} \leq {cut:g}\ GeV}}$"
+    else:
+        note = fr"$\mathbf{{MAP}}$ $\mathbf{{E_{{\nu}},\ E_{{\bar{{\nu}}}} > {cut:g}\ GeV}}$"
+    return df, cut_tag, note
+
+
+def output_subdir(tag, cut_tag=""):
+    """e.g. REF_mapNuE5_paper_plots."""
+    return "_".join(p for p in (tag, cut_tag, "paper_plots") if p)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +439,8 @@ def _overlays(df, var, use_map, index=None):
         overlays.append(("svfit", df[f"svfit_pred_{var}"]))
     if f"transformer_pred_{var}" in df.columns:
         overlays.append(("transformer", df[f"transformer_pred_{var}"]))
+    if f"stable_map_pred_{var}" in df.columns:
+        overlays.append(("stable_map", df[f"stable_map_pred_{var}"]))
     if use_map and f"pred_{var}" in df.columns:
         overlays.append(("sampled", df[f"pred_{var}"]))
     if index is not None:
@@ -362,6 +451,12 @@ def _overlays(df, var, use_map, index=None):
 def _weights_for(vals, weights=None):
     """Per-event weights matching vals' events (None if unweighted)."""
     return weights.loc[vals.index] if weights is not None else None
+
+
+def _add_note(ax, note=None):
+    # above the top-right corner, clear of the legends
+    if note:
+        ax.set_title(note, loc="right", fontsize=16)
 
 
 def _save(fig, path):
@@ -464,7 +559,7 @@ def _var_bins(var, all_vals, bounded, weights=None):
 # Plot drivers
 # ---------------------------------------------------------------------------
 
-def plot_two_panel_vars(df, var_dict, dist_dir, res_dir, use_map=True, bounded=False, weights=None):
+def plot_two_panel_vars(df, var_dict, dist_dir, res_dir, use_map=True, bounded=False, weights=None, note=None):
     """For each variable: distribution + ratio plot, and resolution plot."""
     for var, label in var_dict.items():
         true_col = f"true_{var}"
@@ -477,6 +572,7 @@ def plot_two_panel_vars(df, var_dict, dist_dir, res_dir, use_map=True, bounded=F
         true_vals = df[true_col].dropna()
         main_vals = df[main_col].loc[true_vals.index]
         overlays = _overlays(df, var, use_map, index=true_vals.index)
+        dist_overlays = [(key, vals) for key, vals in overlays if key not in resolution_only]
         weight_true = weights.loc[true_vals.index] if weights is not None else None
         bins = _var_bins(var, [true_vals, main_vals] + [v for _, v in overlays], bounded, weights)
 
@@ -484,18 +580,20 @@ def plot_two_panel_vars(df, var_dict, dist_dir, res_dir, use_map=True, bounded=F
         gs = fig_dist.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.1)
         ax = fig_dist.add_subplot(gs[0])
         ax_ratio = fig_dist.add_subplot(gs[1], sharex=ax)
-        _draw_distribution_ratio(ax, ax_ratio, true_vals, overlays, bins, weight_true)
+        _draw_distribution_ratio(ax, ax_ratio, true_vals, dist_overlays, bins, weight_true)
         ax_ratio.set_xlabel(label)
+        _add_note(ax, note)
         _save(fig_dist, os.path.join(dist_dir, f"{var}.pdf"))
 
         fig_res, ax_res = plt.subplots(figsize=(8, 6))
         _draw_resolution(ax_res, true_vals, main_vals, overlays, label, weights)
+        _add_note(ax_res, note)
         _save(fig_res, os.path.join(res_dir, f"{var}_res.pdf"))
 
         print(f">> Saved paper plots {var}.pdf (distributions/ and resolutions/)")
 
 
-def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None):
+def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None, note=None):
     """Single-panel plots for the tau/boson masses, with the fixed truth value as a line."""
     for var in mass_vars:
         label = pred_taunu_vars[var]
@@ -506,13 +604,14 @@ def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None):
             continue
 
         overlays = _overlays(df, var, use_map)
+        dist_overlays = [(key, vals) for key, vals in overlays if key not in resolution_only]
         is_tau_mass = var in ("tau_plus_mass", "tau_minus_mass")
         truth_val = m_tau if is_tau_mass else m_boson
         bins = np.linspace(0.5, 2.5, 51) if is_tau_mass else np.linspace(70, 150, 51)
 
         fig_dist, ax = plt.subplots(figsize=(8, 6))
         ax.axvline(truth_val, color=truth_color, linestyle="solid", linewidth=2, label="Generator Truth")
-        for key, vals in overlays:
+        for key, vals in dist_overlays:
             color, name = overlay_styles[key]
             ax.hist(vals, bins=bins, histtype="step", weights=_count_norm_weights(len(vals), _weights_for(vals, weights)),
                     linewidth=2, color=color, label=name)
@@ -520,14 +619,16 @@ def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None):
         ax.set_ylabel("Normalized counts")
         ax.set_xlim(bins[0], bins[-1])
         ymin, ymax = ax.get_ylim()
-        ax.set_ylim(ymin, ymax * (1.35 + 0.10 * len(overlays)))
+        ax.set_ylim(ymin, ymax * (1.35 + 0.10 * len(dist_overlays)))
         ax.legend(loc="upper left", fontsize=legendfont)
+        _add_note(ax, note)
         _save(fig_dist, os.path.join(dist_dir, f"{var}.pdf"))
 
         has_true = true_col in df.columns
         if has_true:
             fig_res, ax_res = plt.subplots(figsize=(8, 6))
             _draw_resolution(ax_res, df[true_col].dropna(), df[main_col], overlays, label, weights)
+            _add_note(ax_res, note)
             _save(fig_res, os.path.join(res_dir, f"{var}_res.pdf"))
 
         print(f">> Saved paper plots {var}.pdf (distributions/{' and resolutions/' if has_true else ''})")
@@ -545,6 +646,10 @@ def main():
                         help="Path to an evaluate_svfit.py output parquet (pred_SVfit_* columns, row-aligned "
                              "with --input); overlaid as a purple line if given. Events with a failed "
                              "SVfit fit are left out of the SVfit curves only")
+    parser.add_argument('--stable_map_input', type=str, default=None,
+                        help="Path to an evaluate.py output run with map_method: stable_gradient "
+                             "(stable_map_pred_* columns, row-aligned with --input); shown as an extra "
+                             "'TauPolaris (stable MAP)' prediction if given")
     parser.add_argument('--sampled', action='store_true',
                         help="Use the sampled prediction (pred_*) as the main line instead of the MAP estimate")
     parser.add_argument('--useMLP', action='store_true', help=argparse.SUPPRESS)  # old alias for --sampled
@@ -552,6 +657,7 @@ def main():
     parser.add_argument('--weight', type=str, default=None,
                         help="Name of a column in the input parquet to use as the per-event "
                              "weight for every histogram (distributions, ratios, resolutions, and masses)")
+    add_map_nu_E_cut_args(parser)
     args = parser.parse_args()
     use_map = not (args.sampled or args.useMLP)
 
@@ -563,24 +669,27 @@ def main():
     if args.svfit_input:
         df = load_svfit_predictions(df, args.svfit_input)
         print(f">> Loaded SVfit predictions from {args.svfit_input}")
+    if args.stable_map_input:
+        df = load_stable_map_predictions(df, args.stable_map_input)
+        print(f">> Loaded stable MAP predictions from {args.stable_map_input}")
     if args.weight and args.weight not in df.columns:
         raise ValueError(f"--weight column '{args.weight}' not found in input parquet")
+    df, cut_tag, note = select_events(df, args)
     df = add_all_derived_cols(df)
     weights = df[args.weight] if args.weight else None
 
-    subdir = f"{args.tag}_paper_plots" if args.tag else "paper_plots"
-    output_dir = os.path.join(args.input.replace('.parquet', ''), subdir)
+    output_dir = os.path.join(args.input.replace('.parquet', ''), output_subdir(args.tag, cut_tag))
     dist_dir = os.path.join(output_dir, "distributions")
     res_dir = os.path.join(output_dir, "resolutions")
     os.makedirs(dist_dir, exist_ok=True)
     os.makedirs(res_dir, exist_ok=True)
 
-    plot_two_panel_vars(df, spin_vars, dist_dir, res_dir, use_map, bounded=True, weights=weights)
-    plot_mass_vars(df, dist_dir, res_dir, use_map, weights=weights)
-    plot_two_panel_vars(df, kinematic_vars, dist_dir, res_dir, use_map, weights=weights)
-    plot_two_panel_vars(df, spin_density_vars, dist_dir, res_dir, use_map, bounded=True, weights=weights)
-    plot_two_panel_vars(df, derived_vars, dist_dir, res_dir, use_map, weights=weights)
-    plot_two_panel_vars(df, angle_vars, dist_dir, res_dir, use_map, weights=weights)
+    plot_two_panel_vars(df, spin_vars, dist_dir, res_dir, use_map, bounded=True, weights=weights, note=note)
+    plot_mass_vars(df, dist_dir, res_dir, use_map, weights=weights, note=note)
+    plot_two_panel_vars(df, kinematic_vars, dist_dir, res_dir, use_map, weights=weights, note=note)
+    plot_two_panel_vars(df, spin_density_vars, dist_dir, res_dir, use_map, bounded=True, weights=weights, note=note)
+    plot_two_panel_vars(df, derived_vars, dist_dir, res_dir, use_map, weights=weights, note=note)
+    plot_two_panel_vars(df, angle_vars, dist_dir, res_dir, use_map, weights=weights, note=note)
 
 
 if __name__ == "__main__":
