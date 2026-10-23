@@ -464,14 +464,43 @@ def _save(fig, path):
     plt.close(fig)
 
 
-def _draw_resolution(ax_res, true_vals, main_vals, overlays, label, weights=None):
-    """Per-event (pred - truth) histograms for the main prediction and each overlay."""
+def _residuals(true_vals, main_key, main_vals, overlays):
+    """[(style key, per-event pred - truth)] for each overlay and then the main prediction
+    (legend order), shared by the resolution plots and the residual table."""
     # the main prediction is never NaN, so it covers true_vals' index; overlays may cover fewer
     # events (SVfit failed fits), so each diff only keeps the events where both values exist
-    diff_main = main_vals.loc[true_vals.index] - true_vals
     diffs = [(key, (vals - true_vals).dropna()) for key, vals in overlays]
-    all_diffs = diffs + [("map", diff_main)]
+    return diffs + [(main_key, main_vals.loc[true_vals.index] - true_vals)]
 
+
+def residual_stats(r, weights=None):
+    """Residual summary for the per-run table: bias (mean), median, RMS, std, IQR and the
+    fraction of Tukey 'far out' outliers (beyond Q1 - 3 IQR or Q3 + 3 IQR of r itself)."""
+    w = _weights_for(r, weights)
+    bias = _weighted_mean(r, w)
+    q1, median, q3 = (_quantile(r, q, w) for q in (0.25, 0.5, 0.75))
+    iqr = q3 - q1
+    outlier = ((r < q1 - 3 * iqr) | (r > q3 + 3 * iqr)).astype(float)
+    return {
+        "n_events": len(r),
+        "bias": bias,
+        "median": median,
+        "rms": np.sqrt(_weighted_mean(r**2, w)),
+        "std": np.sqrt(_weighted_mean((r - bias)**2, w)),
+        "iqr": iqr,
+        "outlier_frac": _weighted_mean(outlier, w),
+    }
+
+
+def _add_stats_rows(stats_rows, var, residuals, weights=None):
+    if stats_rows is None:
+        return
+    for key, r in residuals:
+        stats_rows.append({"variable": var, "prediction": overlay_styles[key][1], **residual_stats(r, weights)})
+
+
+def _draw_resolution(ax_res, all_diffs, label, weights=None):
+    """Per-event (pred - truth) histograms, one per entry of all_diffs (from _residuals)."""
     combined_diff = pd.concat([d for _, d in all_diffs])
     if weights is not None:
         combined_weight = pd.concat([_weights_for(d, weights) for _, d in all_diffs])
@@ -491,7 +520,7 @@ def _draw_resolution(ax_res, true_vals, main_vals, overlays, label, weights=None
     ax_res.set_ylabel("Normalized counts")
     ax_res.set_xlim(diff_bins[0], diff_bins[-1])
     ymin, ymax = ax_res.get_ylim()
-    ax_res.set_ylim(ymin, ymax * (1.35 + 0.15 * len(overlays)))
+    ax_res.set_ylim(ymin, ymax * (1.35 + 0.15 * (len(all_diffs) - 1)))
     ax_res.legend(loc="upper left", fontsize=legendfont)
 
 
@@ -559,8 +588,11 @@ def _var_bins(var, all_vals, bounded, weights=None):
 # Plot drivers
 # ---------------------------------------------------------------------------
 
-def plot_two_panel_vars(df, var_dict, dist_dir, res_dir, use_map=True, bounded=False, weights=None, note=None):
-    """For each variable: distribution + ratio plot, and resolution plot."""
+def plot_two_panel_vars(df, var_dict, dist_dir, res_dir, use_map=True, bounded=False, weights=None, note=None,
+                        stats_rows=None):
+    """For each variable: distribution + ratio plot, and resolution plot. Residual statistics
+    for each prediction in the resolution plot are appended to stats_rows if given."""
+    main_key = "map" if use_map else "sampled"
     for var, label in var_dict.items():
         true_col = f"true_{var}"
         main_col = f"map_pred_{var}" if use_map else f"pred_{var}"
@@ -585,16 +617,20 @@ def plot_two_panel_vars(df, var_dict, dist_dir, res_dir, use_map=True, bounded=F
         _add_note(ax, note)
         _save(fig_dist, os.path.join(dist_dir, f"{var}.pdf"))
 
+        residuals = _residuals(true_vals, main_key, main_vals, overlays)
         fig_res, ax_res = plt.subplots(figsize=(8, 6))
-        _draw_resolution(ax_res, true_vals, main_vals, overlays, label, weights)
+        _draw_resolution(ax_res, residuals, label, weights)
         _add_note(ax_res, note)
         _save(fig_res, os.path.join(res_dir, f"{var}_res.pdf"))
+        _add_stats_rows(stats_rows, var, residuals, weights)
 
         print(f">> Saved paper plots {var}.pdf (distributions/ and resolutions/)")
 
 
-def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None, note=None):
-    """Single-panel plots for the tau/boson masses, with the fixed truth value as a line."""
+def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None, note=None, stats_rows=None):
+    """Single-panel plots for the tau/boson masses, with the fixed truth value as a line.
+    Residual statistics are appended to stats_rows where a truth column exists."""
+    main_key = "map" if use_map else "sampled"
     for var in mass_vars:
         label = pred_taunu_vars[var]
         true_col = f"true_{var}"
@@ -626,10 +662,12 @@ def plot_mass_vars(df, dist_dir, res_dir, use_map=True, weights=None, note=None)
 
         has_true = true_col in df.columns
         if has_true:
+            residuals = _residuals(df[true_col].dropna(), main_key, df[main_col], overlays)
             fig_res, ax_res = plt.subplots(figsize=(8, 6))
-            _draw_resolution(ax_res, df[true_col].dropna(), df[main_col], overlays, label, weights)
+            _draw_resolution(ax_res, residuals, label, weights)
             _add_note(ax_res, note)
             _save(fig_res, os.path.join(res_dir, f"{var}_res.pdf"))
+            _add_stats_rows(stats_rows, var, residuals, weights)
 
         print(f">> Saved paper plots {var}.pdf (distributions/{' and resolutions/' if has_true else ''})")
 
@@ -684,12 +722,24 @@ def main():
     os.makedirs(dist_dir, exist_ok=True)
     os.makedirs(res_dir, exist_ok=True)
 
-    plot_two_panel_vars(df, spin_vars, dist_dir, res_dir, use_map, bounded=True, weights=weights, note=note)
-    plot_mass_vars(df, dist_dir, res_dir, use_map, weights=weights, note=note)
-    plot_two_panel_vars(df, kinematic_vars, dist_dir, res_dir, use_map, weights=weights, note=note)
-    plot_two_panel_vars(df, spin_density_vars, dist_dir, res_dir, use_map, bounded=True, weights=weights, note=note)
-    plot_two_panel_vars(df, derived_vars, dist_dir, res_dir, use_map, weights=weights, note=note)
-    plot_two_panel_vars(df, angle_vars, dist_dir, res_dir, use_map, weights=weights, note=note)
+    stats_rows = []
+    kw = dict(weights=weights, note=note, stats_rows=stats_rows)
+    plot_two_panel_vars(df, spin_vars, dist_dir, res_dir, use_map, bounded=True, **kw)
+    plot_mass_vars(df, dist_dir, res_dir, use_map, **kw)
+    plot_two_panel_vars(df, kinematic_vars, dist_dir, res_dir, use_map, **kw)
+    plot_two_panel_vars(df, spin_density_vars, dist_dir, res_dir, use_map, bounded=True, **kw)
+    plot_two_panel_vars(df, derived_vars, dist_dir, res_dir, use_map, **kw)
+    plot_two_panel_vars(df, angle_vars, dist_dir, res_dir, use_map, **kw)
+
+    # one residual table per run, next to the plots: one row per (variable, prediction)
+    leptonic = [c for c in ("reco_taup_ishadronic", "reco_taun_ishadronic") if c in df.columns]
+    channel = "semileptonic" if any((df[c] == 0).any() for c in leptonic) else "hadronic"
+    table = pd.DataFrame(stats_rows)
+    table.insert(0, "channel", channel)
+    table.insert(1, "selection", cut_tag or "none")
+    table_path = os.path.join(output_dir, "residual_stats.csv")
+    table.to_csv(table_path, index=False)
+    print(f">> Saved residual statistics table ({len(table)} rows) to {table_path}")
 
 
 if __name__ == "__main__":
