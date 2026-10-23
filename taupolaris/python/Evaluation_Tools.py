@@ -68,6 +68,7 @@ def flow_map_predict(
     lr=1e-2,
     return_log_prob=False,
     verbose=False,
+    momentum_groups=((0, 1, 2), (3, 4, 5)),
 ):
     """
     Compute MAP (maximum log-probability) predictions from a normalizing flow.
@@ -92,6 +93,13 @@ def flow_map_predict(
         'gradient'            — z-space MAP: optimise z via Adam using the change-of-variables
                                 identity log p = log p_Z(z) - log|det J_decode|. Initialises
                                 from z=0. Single decode pass per step.
+        'stable_gradient'     — same as 'gradient', but maximises the density in spherical
+                                momentum coordinates (|p|, angles) for each neutrino instead of
+                                Cartesian, i.e. log p(x) + 2 log|p| per neutrino. The Cartesian
+                                density picks up a 1/|p|^2 volume factor at p=0, which drags the
+                                'gradient' mode to p_nu ~ 0 for any posterior with support at low
+                                energy; the 2 log|p| term removes it. Needs test_dataset (to get |p|
+                                in physical units) and Cartesian-like outputs (standard/onorm).
         'gradient_warmstart'  — same as 'gradient' but initialises z from the best of
                                 num_draws stochastic samples (encoded back to z-space).
                                 Handles multimodal posteriors: sampling finds the right basin,
@@ -105,6 +113,9 @@ def flow_map_predict(
         Number of Adam steps. Only used by gradient methods.
     lr : float
         Adam learning rate. Only used by gradient methods.
+    momentum_groups : tuple of index tuples
+        Output indices of each neutrino's 3-momentum components. Only used by 'stable_gradient';
+        the default is the hadronic layout (taup_nu_{n,r,k}, taun_nu_{n,r,k}).
     verbose : bool
         If True, show a running average of time-per-event and iterations-per-event in the
         progress bar, updated as more events are processed (so the average keeps refining
@@ -184,15 +195,30 @@ def flow_map_predict(
             all_best_samples.append(best_samples_chunk.cpu())
             _update_postfix(pbar, time.time() - t0, C * num_draws, C, best_log_p_sum)
 
-    elif method == 'gradient':
+    elif method in ('gradient', 'stable_gradient'):
         # optimisation of the MAP estimate in z-space
         latent_dim = model.flow._distribution._shape[0]
+        # X may be kept on CPU (evaluate.py --dataOnCPU), so move each chunk to the model's device
+        model_device = next(model.parameters()).device
 
-        pbar = tqdm(range(0, B, chunk_size), desc="Processing chunks (gradient)")
+        spherical = method == 'stable_gradient'
+        if spherical:
+            if test_dataset is None:
+                raise ValueError("method='stable_gradient' needs test_dataset to compute |p| in physical units")
+            out_mean = test_dataset.output_mean.to(model_device)
+            out_std = test_dataset.output_std.to(model_device)
+
+        def log_volume(x_norm):
+            # 2 log|p| per neutrino: converts the Cartesian density to one per d|p| dOmega
+            # (eps keeps it finite at p=0, where the term is very negative, so never selected)
+            x_phys = x_norm * out_std + out_mean
+            return sum(2 * torch.log(x_phys[:, list(g)].norm(dim=-1) + 1e-6) for g in momentum_groups)
+
+        pbar = tqdm(range(0, B, chunk_size), desc=f"Processing chunks ({method})")
         for start in pbar:
             t0 = time.time()
             end = min(start + chunk_size, B)
-            X_chunk = X[start:end]
+            X_chunk = X[start:end].to(model_device)
             C = X_chunk.shape[0]
 
             # pre-compute the embedding once for this chunk
@@ -207,10 +233,12 @@ def flow_map_predict(
             for step in range(n_steps):
                 optimizer.zero_grad()
                 
-                _, logabsdet = model.flow._transform.inverse(z, context=cond_embed_chunk)
-                
+                x, logabsdet = model.flow._transform.inverse(z, context=cond_embed_chunk)
+
                 log_pz = -0.5 * (z ** 2).sum(dim=-1)
-                log_p = log_pz - logabsdet 
+                log_p = log_pz - logabsdet
+                if spherical:
+                    log_p = log_p + log_volume(x)  # avoid divergence
                 #if step == 0: initial_log_p = log_p.mean().item()
                 (-log_p.sum()).backward()
 
@@ -335,7 +363,7 @@ def flow_map_predict(
             _update_postfix(pbar, time.time() - t0, m.nfcn, 1, -m.fval)  # m.nfcn = number of MIGRAD function calls; m.fval = -log_p at the minimum
 
     else:
-        raise ValueError(f"Unknown method '{method}'. Choose 'stochastic', 'latent_zero', 'gradient', 'gradient_forward', or 'minuit'.")
+        raise ValueError(f"Unknown method '{method}'. Choose 'stochastic', 'latent_zero', 'gradient', 'stable_gradient', 'gradient_forward', or 'minuit'.")
 
     samples_norm_alt = torch.cat(all_best_samples, dim=0)
 
