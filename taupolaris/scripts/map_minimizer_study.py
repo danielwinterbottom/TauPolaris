@@ -100,9 +100,21 @@ def random_starts(n_events, d):
     return np.random.default_rng(12345).standard_normal((n_events, N_RANDOM, d)).astype(np.float32)
 
 
-def logp_z(model, z, ctx):
-    _, logabsdet = model.flow._transform.inverse(z, context=ctx)
-    return -0.5 * (z ** 2).sum(-1) - logabsdet
+# --jac_power k: maximise the density in (|p|, direction) of each neutrino instead of its Cartesian components,
+# log q = log p_cart + (k/2) sum_nu log(|p_nu|^2 + eps^2) with |p| in GeV (k = 2: per unit |p| and solid angle;
+# k = 3: per unit log|p|). The Cartesian density diverges as 1/|p|^2 at p = 0 when the |p| distribution is finite
+# there, which pulls the Cartesian MAP onto p ~ 0. Set by run_method from the output normalisation.
+JAC = {'power': 0.0, 'mean': None, 'std': None, 'eps2': 0.01}
+
+
+def logp_z(model, z, ctx, jac=True):
+    x, logabsdet = model.flow._transform.inverse(z, context=ctx)
+    lp = -0.5 * (z ** 2).sum(-1) - logabsdet
+    if jac and JAC['power']:
+        p = x * JAC['std'].to(x) + JAC['mean'].to(x)          # (n, r, k) of the tau+ and tau- neutrinos, GeV
+        lp = lp + 0.5 * JAC['power'] * (torch.log((p[:, :3] ** 2).sum(-1) + JAC['eps2']) +
+                                        torch.log((p[:, 3:] ** 2).sum(-1) + JAC['eps2']))
+    return lp
 
 
 def adam_ascent(model, z0, ctx, n_steps, lr=1e-2, record=None):
@@ -147,6 +159,11 @@ def run_method(args):
             min(1.0, args.gpu_mem_gb * 1024 ** 3 / torch.cuda.get_device_properties(dev).total_memory), dev)
     model, X, norm, out = load(args.config, args.model_path, args.test_file, args.n_events, dev)
     d = model.flow._distribution._shape[0]
+    if args.jac_power:
+        if d != 6:
+            sys.exit('--jac_power assumes the 6 outputs are the two neutrinos\' (n, r, k) components')
+        JAC.update(power=args.jac_power, mean=torch.as_tensor(norm['output_mean'].reshape(-1)),
+                   std=torch.as_tensor(norm['output_std'].reshape(-1)))
     res = {'loadavg_start': np.array(os.getloadavg()), 'host': np.array(os.uname().nodename), 'device': np.array(args.device)}
     where = res['host']
     if gpu:
@@ -232,6 +249,11 @@ def run_method(args):
         xb = torch.cat([model.flow._transform.inverse(zb[s:s + 1000], context=model.condition_net(X[s:s + 1000]))[0]
                         for s in range(0, len(X), 1000)]).cpu().numpy()
     res['x_best_std'] = xb.astype(np.float32)
+    res['jac_power'] = args.jac_power
+    if args.jac_power:   # the plain (Cartesian) log p of the chosen start too, for comparison with the jac_power=0 runs
+        with torch.no_grad():
+            res['logp_cart_best'] = torch.cat([logp_z(model, zb[s:s + 1000], model.condition_net(X[s:s + 1000]), jac=False)
+                                               for s in range(0, len(X), 1000)]).cpu().numpy()
     res['x_best'] = xb * norm['output_std'].reshape(-1) + norm['output_mean'].reshape(-1)
     res['output_names'] = np.array(out)
     res['loadavg_end'] = np.array(os.getloadavg())
@@ -332,6 +354,8 @@ def main():
     ap.add_argument('--n_events', type=int, default=1000)
     ap.add_argument('--chunk', type=int, default=1000)
     ap.add_argument('--threads', type=int, default=8)
+    ap.add_argument('--jac_power', type=float, default=0.0,
+                    help='maximise log p + (k/2) sum_nu log(|p_nu|^2 + 0.01 GeV^2): 2 = density in (|p|, direction), 3 = in (log|p|, direction)')
     ap.add_argument('--device', default='cpu', help="'cuda' for the gradient methods on a GPU")
     ap.add_argument('--gpu_mem_gb', type=float, default=None, help='with --device cuda: cap on the GPU memory this process may use')
     ap.add_argument('--n_events_slow', type=int, default=None,
