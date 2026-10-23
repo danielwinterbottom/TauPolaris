@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 # also sets up the matplotlib backend and CMS style
 from plot_kinematics_spin import (
-    spin_vars, kinematic_vars, spin_density_vars, derived_vars, angle_vars,
+    spin_vars, kinematic_vars, training_basis_vars, spin_density_vars, derived_vars, angle_vars,
     overlay_styles, load_transformer_predictions, load_svfit_predictions, load_stable_map_predictions,
     add_all_derived_cols,
     add_map_nu_E_cut_args, select_events, output_subdir, _var_bins, _weights_for,
@@ -21,6 +21,7 @@ from plot_kinematics_spin import (
 plot_groups = (
     (spin_vars, True),
     (kinematic_vars, False),
+    (training_basis_vars, False),
     (spin_density_vars, True),
     (derived_vars, False),
     (angle_vars, False),

@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import mplhep as hep
 plt.style.use(hep.style.CMS)
 
+from taupolaris.utils.coordinate_conversions import _build_nrk_basis_from_visible_tau
+
 
 plt.rcParams.update({"font.size": 18, "axes.labelsize": 18, "xtick.labelsize": 18, "ytick.labelsize": 18, "legend.fontsize": 18})
 legendfont = 18
@@ -95,6 +97,18 @@ derived_vars = {
     "nu_phi":       r"$\phi^{\nu_{\tau_2}}$",
     "nubar_eta":    r"$\eta^{\nu_{\tau_1}}$",
     "nubar_phi":    r"$\phi^{\nu_{\tau_1}}$",
+}
+
+
+# neutrino momenta in the flow's training basis: each neutrino projected onto the orthonormal
+# (n, r, k) basis of its own tau's reco visible decay products, so the two use different axes
+training_basis_vars = {
+    "nubar_n": r"$\nu_{\tau_1}$ $p_{n_1}$ (GeV)",
+    "nubar_r": r"$\nu_{\tau_1}$ $p_{r_1}$ (GeV)",
+    "nubar_k": r"$\nu_{\tau_1}$ $p_{k_1}$ (GeV)",
+    "nu_n":    r"$\nu_{\tau_2}$ $p_{n_2}$ (GeV)",
+    "nu_r":    r"$\nu_{\tau_2}$ $p_{r_2}$ (GeV)",
+    "nu_k":    r"$\nu_{\tau_2}$ $p_{k_2}$ (GeV)",
 }
 
 
@@ -248,10 +262,29 @@ def angle_cols(df):
     return new
 
 
+def training_basis_cols(df):
+    """Neutrino momenta projected onto the training (n, r, k) basis, built from each tau's reco
+    visible decay products exactly as in training (DataProcessing): nubar <-> tau+, nu <-> tau-."""
+    new = {}
+    for tau, nu in (("taup", "nubar"), ("taun", "nu")):
+        charged, pi0 = f"reco_{tau}_charged_", f"reco_{tau}_pizero1_"
+        if not _has(df, *(f"{pfx}{c}" for pfx in (charged, pi0) for c in ("px", "py", "pz"))):
+            continue
+        axes = dict(zip("nrk", _build_nrk_basis_from_visible_tau(df, charged, pi0)))
+        for prefix in prefixes:
+            cols = _p3_cols(prefix, nu)
+            if not _has(df, *cols):
+                continue
+            p = df[cols].values
+            for a, axis in axes.items():
+                new[f"{prefix}{nu}_{a}"] = np.sum(p * axis, axis=1)  # NaN predictions stay NaN
+    return new
+
+
 def add_all_derived_cols(df):
-    """Return df with the spin density, derived kinematic and angle columns appended
-    for every prefix whose inputs are present."""
-    new = {**spin_density_cols(df), **derived_kinematic_cols(df), **angle_cols(df)}
+    """Return df with the spin density, derived kinematic, angle and training-basis columns
+    appended for every prefix whose inputs are present."""
+    new = {**spin_density_cols(df), **derived_kinematic_cols(df), **angle_cols(df), **training_basis_cols(df)}
     return pd.concat([df, pd.DataFrame(new, index=df.index)], axis=1)
 
 
@@ -727,6 +760,7 @@ def main():
     plot_two_panel_vars(df, spin_vars, dist_dir, res_dir, use_map, bounded=True, **kw)
     plot_mass_vars(df, dist_dir, res_dir, use_map, **kw)
     plot_two_panel_vars(df, kinematic_vars, dist_dir, res_dir, use_map, **kw)
+    plot_two_panel_vars(df, training_basis_vars, dist_dir, res_dir, use_map, **kw)
     plot_two_panel_vars(df, spin_density_vars, dist_dir, res_dir, use_map, bounded=True, **kw)
     plot_two_panel_vars(df, derived_vars, dist_dir, res_dir, use_map, **kw)
     plot_two_panel_vars(df, angle_vars, dist_dir, res_dir, use_map, **kw)
