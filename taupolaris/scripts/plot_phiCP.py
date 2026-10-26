@@ -62,6 +62,14 @@ options = {
         'label': 'TauPolaris',
         'tag':   'RecoNu_Smeared_TS',
     },
+    'recoNu_circmean': {
+        'label': 'TauPolaris (circular mean of flow samples)',
+        'tag':   'RecoNu_CircMean',
+    },
+    'recoNu_mapcol': {
+        'label': 'TauPolaris',
+        'tag':   'RecoNu_MapCol',
+    },
     'recoPolvec': {
         'label': 'Polarimetric Vector (Flow, direct)',
         'tag':   'PolVecDirect',
@@ -268,6 +276,10 @@ def compute_phicp_all(df, option, use_map=True, output_dir='.'):
         phiCPmain = compute_aco_classic(R1, P1, R2, P2, leg1_is_dp, leg2_is_dp)
         phiCPa1a1 = compute_aco_classic_a1a1(df)
         phiCP = np.where((df['taup_DM'] == 10) & (df['taun_DM'] == 10), phiCPa1a1, phiCPmain)
+    elif option in ('recoNu_circmean', 'recoNu_mapcol'):
+        # precomputed by evaluate.py --inc_phiCP_error with the same method as 'recoNu': the circular mean of the
+        # per-event flow samples' phiCP, or the MAP's own phiCP (a check that it reproduces 'recoNu')
+        phiCP = df['pred_phiCP_circmean' if option == 'recoNu_circmean' else 'map_pred_phiCP'].values
     elif option == 'recoPolvec':
         # phiCP already computed by evaluate_polvec.py -- just read it, no calculateHH needed
         phiCP = df['pred_phiCP'].values
@@ -354,7 +366,7 @@ def compute_vis_pt(df, prefix):
 # columns true_taup_* / true_taun_* are added for the TauSpinner options and --GENfilter. Reading only these keeps the
 # full hadronic results file (3.4M events, ~250 columns) within a 16 GB login-node session.
 _COLUMN_PREFIXES = ('map_pred_tau_', 'pred_tau_', 'true_tau_', 'reco_taup_', 'reco_taun_', 'tauspinner_wt_', 'FastMTT_')
-_COLUMNS = ('taup_DM', 'taun_DM', 'pred_phiCP')
+_COLUMNS = ('taup_DM', 'taun_DM', 'pred_phiCP', 'pred_phiCP_circmean', 'map_pred_phiCP')
 
 
 def read_needed_columns(path, with_true_decays=False):
@@ -402,7 +414,7 @@ def load_data(prefix='', extra_pt_cut=-1, uncorrelated=False, with_true_decays=F
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--option', choices=['gen', 'gen_ts', 'recoRun3', 'recoNu', 'recoNu_ts', 'recoPolvec'],
+    parser.add_argument('-o', '--option', choices=['gen', 'gen_ts', 'recoRun3', 'recoNu', 'recoNu_ts', 'recoNu_circmean', 'recoNu_mapcol', 'recoPolvec'],
                         default='gen', help="Reconstruction method to use.")
     parser.add_argument('--output-dir', default='.', help="Directory for output PDFs.")
     parser.add_argument('--useMLP', action='store_true')
@@ -468,7 +480,7 @@ def main():
     # (e.g. a single charged-pion momentum instead of the full 3-prong tau momentum) rather
     # than erroring -- so DM=11 must stay excluded there. 'recoPolvec' is left out too since
     # it's not confirmed the underlying flow model was trained/evaluated on DM=11 legs.
-    supports_dm11 = args.option in ('gen', 'gen_ts', 'recoNu', 'recoNu_ts')
+    supports_dm11 = args.option in ('gen', 'gen_ts', 'recoNu', 'recoNu_ts', 'recoNu_circmean', 'recoNu_mapcol')
 
     if args.leptonic_mode == 1:
         dm_combs = [[100, 0], [100,1], [100,2], [100,10]]

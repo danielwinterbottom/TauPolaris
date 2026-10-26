@@ -1,8 +1,10 @@
 import torch
 from tqdm import tqdm
 import numpy as np
+import awkward as ak
 from taupolaris.utils.kinematic_helpers import polarimetric_vector_tau, compute_spin_angles, boost_vector, boost, compute_spin_density_vars
 from taupolaris.utils.coordinate_conversions import ConvertFromOrthonormalNRK_Predictions, convert_coordinates_pred
+from taupolaris.utils.acoplanarity_tools import get_ditau_polarimetric, decay_mode_codes
 import os
 import matplotlib
 matplotlib.use('Agg')
@@ -24,6 +26,8 @@ def flow_map_predict(
     verbose=False,
     n_random_starts=10,
     seed=12345,
+    momentum_groups=((0, 1, 2), (3, 4, 5)),
+    momentum_power=2,
 ):
     """
     Compute MAP (maximum log-probability) predictions from a normalizing flow.
@@ -48,12 +52,24 @@ def flow_map_predict(
         'gradient'            — z-space MAP: optimise z via Adam using the change-of-variables
                                 identity log p = log p_Z(z) - log|det J_decode|. Initialises
                                 from z=0. Single decode pass per step.
+        'stable_gradient'     — same as 'gradient', but maximises the density in spherical
+                                momentum coordinates (|p|, angles) for each neutrino instead of
+                                Cartesian, i.e. log p(x) + 2 log|p| per neutrino. The Cartesian
+                                density picks up a 1/|p|^2 volume factor at p=0, which drags the
+                                'gradient' mode to p_nu ~ 0 for any posterior with support at low
+                                energy; the 2 log|p| term removes it (map_minimizer_study.py
+                                --jac_power 2). Needs test_dataset (to get |p| in physical units)
+                                and Cartesian-like outputs (standard/onorm). The returned log p
+                                is the Cartesian one, without the 2 log|p| terms.
         'gradient_multistart' — 'gradient' from z=0 plus n_random_starts starts z ~ N(0, 1), all run
                                 in parallel; the highest final log p per event is kept (multi200 of
                                 map_minimizer_study.py: the same starts, from one generator seeded
                                 with `seed`, so they don't depend on the chunking). chunk_size counts
                                 optimised rows, i.e. chunk_size // (1 + n_random_starts) events per
                                 chunk, so the memory is that of 'gradient' with the same chunk_size.
+        'stable_gradient_multistart' — 'gradient_multistart' with the objective of 'stable_gradient'
+                                (log p + 2 log|p| per neutrino), which also picks the best start; the
+                                returned log p is the Cartesian one of that start.
         'gradient_warmstart'  — same as 'gradient' but initialises z from the best of
                                 num_draws stochastic samples (encoded back to z-space).
                                 Handles multimodal posteriors: sampling finds the right basin,
@@ -69,6 +85,13 @@ def flow_map_predict(
         Random starts per event and their generator seed. Only used by 'gradient_multistart'.
     lr : float
         Adam learning rate. Only used by gradient methods.
+    momentum_groups : tuple of index tuples
+        Output indices of each neutrino's 3-momentum components. Only used by the 'stable_gradient' methods;
+        the default is the hadronic layout (taup_nu_{n,r,k}, taun_nu_{n,r,k}).
+    momentum_power : float
+        k in the 'stable_gradient' objective log p + k log|p| per neutrino. 2 (default): density per
+        d|p| dOmega. 1: density per d|p| dphi dm^2 (neutrino energy, azimuth about the visible tau and
+        visible+neutrino invariant mass), since d^3p = |p| / (2 |p_vis|) d|p| dphi dm^2.
     verbose : bool
         If True, show a running average of time-per-event and iterations-per-event in the
         progress bar, updated as more events are processed (so the average keeps refining
@@ -110,6 +133,19 @@ def flow_map_predict(
                 'avg_log_p': f"{_total_log_p / _total_events:.3f}",
             })
 
+    spherical = method.startswith('stable_gradient')
+    if spherical:
+        if test_dataset is None:
+            raise ValueError(f"method='{method}' needs test_dataset to compute |p| in physical units")
+        out_mean = test_dataset.output_mean.to(X.device)
+        out_std = test_dataset.output_std.to(X.device)
+
+    def log_volume(x_norm):
+        # momentum_power * log|p| per neutrino: 2 converts the Cartesian density to one per d|p| dOmega
+        # (eps keeps it finite at p=0, where the term is very negative, so never selected)
+        x_phys = x_norm * out_std + out_mean
+        return sum(momentum_power * torch.log(x_phys[:, list(g)].norm(dim=-1) + 1e-6) for g in momentum_groups)
+
     if method == 'latent_zero':
         # this doesn't work very well, but might as well leave it in
         latent_dim = model.flow._distribution._shape[0]
@@ -148,11 +184,11 @@ def flow_map_predict(
             all_best_samples.append(best_samples_chunk.cpu())
             _update_postfix(pbar, time.time() - t0, C * num_draws, C, best_log_p_sum)
 
-    elif method == 'gradient':
+    elif method in ('gradient', 'stable_gradient'):
         # optimisation of the MAP estimate in z-space
         latent_dim = model.flow._distribution._shape[0]
 
-        pbar = tqdm(range(0, B, chunk_size), desc="Processing chunks (gradient)")
+        pbar = tqdm(range(0, B, chunk_size), desc=f"Processing chunks ({method})")
         for start in pbar:
             t0 = time.time()
             end = min(start + chunk_size, B)
@@ -171,12 +207,15 @@ def flow_map_predict(
             for step in range(n_steps):
                 optimizer.zero_grad()
                 
-                _, logabsdet = model.flow._transform.inverse(z, context=cond_embed_chunk)
+                x, logabsdet = model.flow._transform.inverse(z, context=cond_embed_chunk)
                 
                 log_pz = -0.5 * (z ** 2).sum(dim=-1)
                 log_p = log_pz - logabsdet 
                 #if step == 0: initial_log_p = log_p.mean().item()
-                (-log_p.sum()).backward()
+                if spherical:
+                    (-(log_p + log_volume(x)).sum()).backward()  # avoid divergence
+                else:
+                    (-log_p.sum()).backward()
 
                 optimizer.step()
 
@@ -202,7 +241,7 @@ def flow_map_predict(
             all_best_samples.append(x_map.cpu())
             _update_postfix(pbar, time.time() - t0, C * n_steps, C, log_p.detach().sum().item())
 
-    elif method == 'gradient_multistart':
+    elif method in ('gradient_multistart', 'stable_gradient_multistart'):
         latent_dim = model.flow._distribution._shape[0]
         S = 1 + n_random_starts
         ev_chunk = max(1, chunk_size // S)
@@ -225,23 +264,25 @@ def flow_map_predict(
 
             for step in range(n_steps + 1):
                 optimizer.zero_grad()
-                _, logabsdet = model.flow._transform.inverse(z, context=cond_embed_chunk)
+                x, logabsdet = model.flow._transform.inverse(z, context=cond_embed_chunk)
                 log_p = -0.5 * (z ** 2).sum(dim=-1) - logabsdet
+                objective = log_p + log_volume(x) if spherical else log_p
                 if step == n_steps:   # log p at the end point of every start, to pick the best
                     break
-                (-log_p.sum()).backward()
+                (-objective.sum()).backward()
                 optimizer.step()
 
             log_p = log_p.detach().reshape(C, S)
-            best = log_p.argmax(1)
+            best = objective.detach().reshape(C, S).argmax(1)
             z_best = z.detach().reshape(C, S, latent_dim)[torch.arange(C, device=z.device), best]
+            log_p_best = log_p[torch.arange(C, device=log_p.device), best]
             if return_log_prob:
-                all_best_log_probs.append(log_p.max(1).values.cpu())
+                all_best_log_probs.append(log_p_best.cpu())
 
             with torch.no_grad():
                 x_map, _ = model.flow._transform.inverse(z_best, context=cond_embed_chunk.reshape(C, S, -1)[:, 0])
             all_best_samples.append(x_map.cpu())
-            _update_postfix(pbar, time.time() - t0, C * S * n_steps, C, log_p.max(1).values.sum().item())
+            _update_postfix(pbar, time.time() - t0, C * S * n_steps, C, log_p_best.sum().item())
 
     elif method == 'gradient_forward':
 
@@ -333,7 +374,7 @@ def flow_map_predict(
             _update_postfix(pbar, time.time() - t0, m.nfcn, 1, -m.fval)  # m.nfcn = number of MIGRAD function calls; m.fval = -log_p at the minimum
 
     else:
-        raise ValueError(f"Unknown method '{method}'. Choose 'stochastic', 'latent_zero', 'gradient', 'gradient_multistart', 'gradient_forward', or 'minuit'.")
+        raise ValueError(f"Unknown method '{method}'. Choose 'stochastic', 'latent_zero', 'gradient', 'stable_gradient', 'gradient_multistart', 'stable_gradient_multistart', 'gradient_forward', or 'minuit'.")
 
     samples_norm_alt = torch.cat(all_best_samples, dim=0)
 
@@ -347,7 +388,45 @@ def flow_map_predict(
     return samples_norm_alt, samples_alt
 
 
+def spin_angles_from_polarimetric(h_plus, k_plus, h_minus, k_minus):
+    """The spin projections cos theta_{n,r,k}^+- (and cosTheta) of kinematic_helpers.compute_spin_angles from the
+    polarimetric vectors and unit tau directions in the ditau rest frame, as returned by
+    acoplanarity_tools.get_ditau_polarimetric (the vectors phiCP is computed from). Also returns h+ and h- as (N, 3)
+    arrays, zero for legs of no known decay mode."""
+    as_np = lambda v: np.stack([ak.to_numpy(v.x), ak.to_numpy(v.y), ak.to_numpy(v.z)], axis=1)
+    hp, hm = as_np(h_plus), as_np(h_minus)
+    hp[hp[:, 0] == -9999.] = 0.
+    hm[hm[:, 0] == -9999.] = 0.
+    kp = as_np(k_plus)
+    # compute_spin_angles takes four-vectors and uses only the direction of the tau+
+    taup4 = np.column_stack([np.ones(len(kp)), kp])
+    return compute_spin_angles(taup4, taup4, hp, hm), hp, hm
+
+
 def compute_spin_vars(df, tau_pred_prefix='true_', tau_vis_prefix='', store_polvecs=False):
+    """Adds {tau_pred_prefix}cos{n,r,k}_{plus,minus} and cosTheta (and with store_polvecs the polarimetric vectors
+    {tau_pred_prefix}h_{plus,minus}_{x,y,z}: tau rest frames reached through the ditau frame, lab-aligned axes) for the
+    taus {tau_pred_prefix}tau_{plus,minus} and the visible decay products {tau_vis_prefix}{taup,taun}_*.
+    With reco_/true_ decay products and their decay-mode flags, the polarimetric vectors are those phiCP is computed
+    from (acoplanarity_tools.get_ditau_polarimetric, with the 3h+pi0 current for DM 11); otherwise the older
+    implementation (_compute_spin_vars_legacy)."""
+    vis = tau_vis_prefix.rstrip('_')
+    needed = [f'{tau_vis_prefix}{t}_{c}' for t in ('taup', 'taun') for c in ('pi2_px', 'pi3_px', 'ishadronic', 'npizero', 'is3prong')]
+    if vis not in ('reco', 'true') or not all(c in df.columns for c in needed):
+        return _compute_spin_vars_legacy(df, tau_pred_prefix, tau_vis_prefix, store_polvecs)
+    h_plus, k_plus, h_minus, k_minus = get_ditau_polarimetric(
+        df, tau_prefix=tau_pred_prefix.rstrip('_'), reco_pions=(vis == 'reco'), dm=decay_mode_codes(df, vis), verbose=False)
+    spin_angles, hp, hm = spin_angles_from_polarimetric(h_plus, k_plus, h_minus, k_minus)
+    for key, values in spin_angles.items():
+        df[f'{tau_pred_prefix}{key}'] = values
+    if store_polvecs:
+        for c, k in enumerate('xyz'):
+            df[f'{tau_pred_prefix}h_plus_{k}'] = hp[:, c]
+            df[f'{tau_pred_prefix}h_minus_{k}'] = hm[:, c]
+    return df
+
+
+def _compute_spin_vars_legacy(df, tau_pred_prefix='true_', tau_vis_prefix='', store_polvecs=False):
 
     taup = df[[f'{tau_pred_prefix}tau_plus_E', f'{tau_pred_prefix}tau_plus_px', f'{tau_pred_prefix}tau_plus_py', f'{tau_pred_prefix}tau_plus_pz']].values
     taun = df[[f'{tau_pred_prefix}tau_minus_E', f'{tau_pred_prefix}tau_minus_px', f'{tau_pred_prefix}tau_minus_py', f'{tau_pred_prefix}tau_minus_pz']].values

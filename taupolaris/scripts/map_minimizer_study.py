@@ -101,10 +101,12 @@ def random_starts(n_events, d):
 
 
 # --jac_power k: maximise the density in (|p|, direction) of each neutrino instead of its Cartesian components,
-# log q = log p_cart + (k/2) sum_nu log(|p_nu|^2 + eps^2) with |p| in GeV (k = 2: per unit |p| and solid angle;
+# log q = log p_cart + k sum_nu log(|p_nu| + eps) with |p| in GeV (k = 2: per unit |p| and solid angle;
 # k = 3: per unit log|p|). The Cartesian density diverges as 1/|p|^2 at p = 0 when the |p| distribution is finite
 # there, which pulls the Cartesian MAP onto p ~ 0. Set by run_method from the output normalisation.
-JAC = {'power': 0.0, 'mean': None, 'std': None, 'eps2': 0.01}
+# k = 2 is flow_map_predict(method='stable_gradient') exactly, including eps = 1e-6 (until 23 Oct 2026 the
+# regulator here was log(|p|^2 + 0.01) / 2 per unit k; outputs map_minimizer_study_jac/).
+JAC = {'power': 0.0, 'mean': None, 'std': None, 'eps': 1e-6}
 
 
 def logp_z(model, z, ctx, jac=True):
@@ -112,8 +114,8 @@ def logp_z(model, z, ctx, jac=True):
     lp = -0.5 * (z ** 2).sum(-1) - logabsdet
     if jac and JAC['power']:
         p = x * JAC['std'].to(x) + JAC['mean'].to(x)          # (n, r, k) of the tau+ and tau- neutrinos, GeV
-        lp = lp + 0.5 * JAC['power'] * (torch.log((p[:, :3] ** 2).sum(-1) + JAC['eps2']) +
-                                        torch.log((p[:, 3:] ** 2).sum(-1) + JAC['eps2']))
+        lp = lp + JAC['power'] * (torch.log(p[:, :3].norm(dim=-1) + JAC['eps']) +
+                                  torch.log(p[:, 3:].norm(dim=-1) + JAC['eps']))
     return lp
 
 
@@ -355,7 +357,7 @@ def main():
     ap.add_argument('--chunk', type=int, default=1000)
     ap.add_argument('--threads', type=int, default=8)
     ap.add_argument('--jac_power', type=float, default=0.0,
-                    help='maximise log p + (k/2) sum_nu log(|p_nu|^2 + 0.01 GeV^2): 2 = density in (|p|, direction), 3 = in (log|p|, direction)')
+                    help='maximise log p + k sum_nu log(|p_nu| / GeV + 1e-6): 2 = density in (|p|, direction) (= stable_gradient), 3 = in (log|p|, direction)')
     ap.add_argument('--device', default='cpu', help="'cuda' for the gradient methods on a GPU")
     ap.add_argument('--gpu_mem_gb', type=float, default=None, help='with --device cuda: cap on the GPU memory this process may use')
     ap.add_argument('--n_events_slow', type=int, default=None,

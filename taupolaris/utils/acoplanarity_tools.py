@@ -359,19 +359,70 @@ def compute_aco_classic_a1a1(df):
 
 
 
-def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=True):
+def decay_mode_codes(df, prefix):
+    """(taup, taun) decay-mode codes, 0/1/2/10/11 hadronic, 100 leptonic, -1 unmatched, from the
+    {prefix}_{taup,taun}_{ishadronic,npizero,is3prong} flags ('reco' or 'true')."""
+    dm = []
+    for tau in ('taup', 'taun'):
+        is_lep = df[f'{prefix}_{tau}_ishadronic'].values == 0
+        npizero = df[f'{prefix}_{tau}_npizero'].values
+        is3prong = df[f'{prefix}_{tau}_is3prong'].values
+        is_dm0 = (npizero == 0) & (is3prong == 0) & (~is_lep)
+        is_dm1 = (npizero == 1) & (is3prong == 0) & (~is_lep)
+        is_dm2 = ((npizero == 1) | (npizero == 2)) & (is3prong == 0) & (~is_lep)
+        is_dm10 = (npizero == 0) & (is3prong == 1) & (~is_lep)
+        is_dm11 = (npizero == 1) & (is3prong == 1) & (~is_lep)
+        dm.append(np.where(is_dm0, 0,
+                    np.where(is_dm1, 1,
+                        np.where(is_dm2, 2,
+                            np.where(is_dm10, 10,
+                                np.where(is_dm11, 11,
+                                    np.where(is_lep, 100, -1)))))))
+    return dm[0], dm[1]
+
+
+def _p4(df, prefix):
+    # from the numpy columns: ak.zip of pandas Series goes through ak.from_iter, a Python loop over the rows
+    return ak.zip({c: df[f"{prefix}_{c}"].values for c in ("px", "py", "pz", "E")}, with_name="Momentum4D")
+
+
+def _leg_polarimetric(dm, tau_rf, bv_tau, higgs_bv, piOS, piSS1, piSS2, pizero, lep, taucharge):
+    """Polarimetric vector of one tau leg (tau rest frame reached from the ditau rest frame), with the formula of each
+    decay mode evaluated only on the rows of that mode; -9999 for rows of no known mode. The decay products are given
+    in the lab frame and boosted to the ditau rest frame (higgs_bv) only on the rows that use them."""
+    out = np.full((len(dm), 3), -9999.0)
+    modes = (
+        (dm == 0,             lambda m, rf: polarimetric_vec_dm0(rf(piOS), bv_tau[m])),
+        (np.isin(dm, (1, 2)), lambda m, rf: polarimetric_vec_dm1(rf(piOS), rf(pizero), tau_rf[m], bv_tau[m])),
+        (dm == 10,            lambda m, rf: polarimetric_vec_dm10(tau_rf[m], rf(piOS), rf(piSS1), rf(piSS2), taucharge)),
+        (dm == 11,            lambda m, rf: polarimetric_vec_dm11(tau_rf[m], rf(piOS), rf(piSS1), rf(piSS2), rf(pizero), taucharge)),
+        (dm == 100,           lambda m, rf: polarimetric_vec_leptonic(rf(lep), bv_tau[m])),
+    )
+    for mask, polvec in modes:
+        if mask.any():
+            pv = polvec(mask, lambda v, m=mask: boost4(v[m], higgs_bv[m]))
+            out[mask] = np.stack([ak.to_numpy(pv.x), ak.to_numpy(pv.y), ak.to_numpy(pv.z)], axis=1)
+    return ak.zip({"x": out[:, 0], "y": out[:, 1], "z": out[:, 2]}, with_name="Vector3D")
+
+
+def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=True, dm=None, verbose=True):
     """
     tau_prefix: sets whether reco or true tau is used ("true" or "map_pred")
     reco_pions: sets whether to use reco pions or true pions (some storage issues in gen)
     add_ghosts: whether to add a "ghost" particle with small momentum to taus to handel cases where neutrinos are predicted to have zero momentum which causes issues for the polarimetric vector calculation. 
+    dm: optional (taup DM, taun DM) arrays to use instead of df["taup_DM"], df["taun_DM"]
+    Returns the polarimetric vectors of the tau+ and tau- (each in its rest frame, reached from the ditau rest frame)
+    and the unit tau+ and tau- directions in the ditau rest frame: h+, k+, h-, k-.
     """
 
     # Get R and P (polarimetric vector edition)
     if reco_pions:
-        print(">> Using reconstructed pions for polarimetric vector calculation.")
+        if verbose:
+            print(">> Using reconstructed pions for polarimetric vector calculation.")
         pion_prefix = 'reco'
     else:
-        print('>> Using true pions for polarimetric vector calculation.')
+        if verbose:
+            print('>> Using true pions for polarimetric vector calculation.')
         pion_prefix = 'true'
 
     # check if pi2 exists if not return 0
@@ -381,42 +432,19 @@ def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=Tr
         zero_vector = ak.zip({"x": ak.zeros_like(df[f"{pion_prefix}_taup_pi1_px"]), "y": ak.zeros_like(df[f"{pion_prefix}_taup_pi1_px"]), "z": ak.zeros_like(df[f"{pion_prefix}_taup_pi1_px"])}, with_name="Vector3D")
         return zero_vector, zero_vector, zero_vector, zero_vector 
 
-    # Tau plus decay mode
-    taup_is_leptonic = df["taup_DM"].values == 100
-    taup_is_dm0 = df["taup_DM"].values == 0
-    taup_is_dm1or2 = df["taup_DM"].isin([1, 2]).values
-    taup_is_dm10 = df["taup_DM"].values == 10
-    taup_is_dm11 = df["taup_DM"].values == 11
+    taup_dm, taun_dm = (df["taup_DM"].values, df["taun_DM"].values) if dm is None else (np.asarray(dm[0]), np.asarray(dm[1]))
 
-    # Tau plus decay products
-    piOS_p = ak.zip({"px": df[f"{pion_prefix}_taup_pi1_px"], "py": df[f"{pion_prefix}_taup_pi1_py"], "pz": df[f"{pion_prefix}_taup_pi1_pz"], "E": df[f"{pion_prefix}_taup_pi1_E"]}, with_name="Momentum4D")  # only actually OS in 3 prong case
-    piSS1_p = ak.zip({"px": df[f"{pion_prefix}_taup_pi2_px"], "py": df[f"{pion_prefix}_taup_pi2_py"], "pz": df[f"{pion_prefix}_taup_pi2_pz"], "E": df[f"{pion_prefix}_taup_pi2_E"]}, with_name="Momentum4D")
-    piSS2_p = ak.zip({"px": df[f"{pion_prefix}_taup_pi3_px"], "py": df[f"{pion_prefix}_taup_pi3_py"], "pz": df[f"{pion_prefix}_taup_pi3_pz"], "E": df[f"{pion_prefix}_taup_pi3_E"]}, with_name="Momentum4D")
-    pizero_p = ak.zip({"px": df[f"{pion_prefix}_taup_pizero1_px"], "py": df[f"{pion_prefix}_taup_pizero1_py"], "pz": df[f"{pion_prefix}_taup_pizero1_pz"], "E": df[f"{pion_prefix}_taup_pizero1_E"]}, with_name="Momentum4D")
-    lep_p = ak.zip({"px": df[f"{pion_prefix}_taup_charged_px"], "py": df[f"{pion_prefix}_taup_charged_py"], "pz": df[f"{pion_prefix}_taup_charged_pz"], "E": df[f"{pion_prefix}_taup_charged_E"]}, with_name="Momentum4D")
+    # Tau plus decay products (pi1 is only actually OS in the 3 prong case), and the tau plus
+    piOS_p, piSS1_p, piSS2_p = (_p4(df, f"{pion_prefix}_taup_{p}") for p in ("pi1", "pi2", "pi3"))
+    pizero_p = _p4(df, f"{pion_prefix}_taup_pizero1")
+    lep_p = _p4(df, f"{pion_prefix}_taup_charged")
+    tau_p = _p4(df, f"{tau_prefix}_tau_plus")
 
-    # Tau plus
-    tau_p = ak.zip({"px": df[f"{tau_prefix}_tau_plus_px"], "py": df[f"{tau_prefix}_tau_plus_py"], "pz": df[f"{tau_prefix}_tau_plus_pz"], "E": df[f"{tau_prefix}_tau_plus_E"]}, with_name="Momentum4D")
-
-    # Tau minus decay mode
-    taun_is_leptonic = df["taun_DM"].values == 100
-    taun_is_dm0 = df["taun_DM"].values == 0
-    taun_is_dm1or2 = df["taun_DM"].isin([1, 2]).values
-    taun_is_dm10 = df["taun_DM"].values == 10
-    taun_is_dm11 = df["taun_DM"].values == 11
-
-    # Tau minus decay products
-
-    piOS_n = ak.zip({"px": df[f"{pion_prefix}_taun_pi1_px"], "py": df[f"{pion_prefix}_taun_pi1_py"], "pz": df[f"{pion_prefix}_taun_pi1_pz"], "E": df[f"{pion_prefix}_taun_pi1_E"]}, with_name="Momentum4D")
-    piSS1_n = ak.zip({"px": df[f"{pion_prefix}_taun_pi2_px"], "py": df[f"{pion_prefix}_taun_pi2_py"], "pz": df[f"{pion_prefix}_taun_pi2_pz"], "E": df[f"{pion_prefix}_taun_pi2_E"]}, with_name="Momentum4D")
-    piSS2_n = ak.zip({"px": df[f"{pion_prefix}_taun_pi3_px"], "py": df[f"{pion_prefix}_taun_pi3_py"], "pz": df[f"{pion_prefix}_taun_pi3_pz"], "E": df[f"{pion_prefix}_taun_pi3_E"]}, with_name="Momentum4D")
-    pizero_n = ak.zip({"px": df[f"{pion_prefix}_taun_pizero1_px"], "py": df[f"{pion_prefix}_taun_pizero1_py"], "pz": df[f"{pion_prefix}_taun_pizero1_pz"], "E": df[f"{pion_prefix}_taun_pizero1_E"]}, with_name="Momentum4D")
-    lep_n = ak.zip({"px": df[f"{pion_prefix}_taun_charged_px"], "py": df[f"{pion_prefix}_taun_charged_py"], "pz": df[f"{pion_prefix}_taun_charged_pz"], "E": df[f"{pion_prefix}_taun_charged_E"]}, with_name="Momentum4D")
-
-    #lep_n = ak.zip({"px": df[f"{tau_prefix}_taun_lep_px"], "py": df[f"{tau_prefix}_taun_lep_py"], "pz": df[f"{tau_prefix}_taun_lep_pz"], "E": df[f"{tau_prefix}_taun_lep_E"]}, with_name="Momentum4D")
-
-    # Tau minus
-    tau_n = ak.zip({"px": df[f"{tau_prefix}_tau_minus_px"], "py": df[f"{tau_prefix}_tau_minus_py"], "pz": df[f"{tau_prefix}_tau_minus_pz"], "E": df[f"{tau_prefix}_tau_minus_E"]}, with_name="Momentum4D")
+    # Tau minus decay products, and the tau minus
+    piOS_n, piSS1_n, piSS2_n = (_p4(df, f"{pion_prefix}_taun_{p}") for p in ("pi1", "pi2", "pi3"))
+    pizero_n = _p4(df, f"{pion_prefix}_taun_pizero1")
+    lep_n = _p4(df, f"{pion_prefix}_taun_charged")
+    tau_n = _p4(df, f"{tau_prefix}_tau_minus")
 
     if add_ghosts:
         # add small "ghost" particle to the taus to handle cases where the tau momentum is exactly equal to the visible momentum (i.e when neutrino was estimated to have exactly zero momentum)
@@ -434,43 +462,17 @@ def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=Tr
     # Higgs rest frame boost vectors
     higgs_bv = boost_vec(tau_p + tau_n)
 
-    # Boost the decay products to the Higgs rest frame
+    # Boost the taus to the Higgs rest frame (their decay products are boosted in _leg_polarimetric)
     tau_p_rf = boost4(tau_p, higgs_bv)
     tau_n_rf = boost4(tau_n, higgs_bv)
-    piOS_p_rf  = boost4(piOS_p, higgs_bv)
-    piSS1_p_rf  = boost4(piSS1_p, higgs_bv)
-    piSS2_p_rf = boost4(piSS2_p, higgs_bv)
-    pizero_p_rf = boost4(pizero_p, higgs_bv)
-    lep_p_rf = boost4(lep_p, higgs_bv)
-    piOS_n_rf  = boost4(piOS_n, higgs_bv)
-    piSS1_n_rf  = boost4(piSS1_n, higgs_bv)
-    piSS2_n_rf = boost4(piSS2_n, higgs_bv)
-    pizero_n_rf = boost4(pizero_n, higgs_bv)
-    lep_n_rf = boost4(lep_n, higgs_bv)
 
     # Tau rest frame boost vectors (from Higgs rest frame)
     bv_taup = boost_vec(tau_p_rf)
     bv_taun = boost_vec(tau_n_rf)
 
     # Get the polarimetric vectors
-    default = ak.zip({"x": ak.full_like(piOS_p_rf.px, -9999.0),
-                        "y": ak.full_like(piOS_p_rf.py, -9999.0),
-                        "z": ak.full_like(piOS_p_rf.pz, -9999.0)}, with_name="Vector3D")
-
-    taup_s = ak.where(taup_is_dm0, polarimetric_vec_dm0(piOS_p_rf, bv_taup),
-                        ak.where(taup_is_dm1or2, polarimetric_vec_dm1(piOS_p_rf, pizero_p_rf, tau_p_rf, bv_taup),
-                                 ak.where(taup_is_dm10, polarimetric_vec_dm10(tau_p_rf, piOS_p_rf, piSS1_p_rf, piSS2_p_rf, +1),
-                                    ak.where(taup_is_dm11, polarimetric_vec_dm11(tau_p_rf, piOS_p_rf, piSS1_p_rf, piSS2_p_rf, pizero_p_rf, +1),
-                                       ak.where(taup_is_leptonic, polarimetric_vec_leptonic(lep_p_rf, bv_taup),
-                                             default)))))
-
-
-    taun_s = ak.where(taun_is_dm0, polarimetric_vec_dm0(piOS_n_rf, bv_taun),
-                        ak.where(taun_is_dm1or2, polarimetric_vec_dm1(piOS_n_rf, pizero_n_rf, tau_n_rf, bv_taun),
-                                 ak.where(taun_is_dm10, polarimetric_vec_dm10(tau_n_rf, piOS_n_rf, piSS1_n_rf, piSS2_n_rf, -1),
-                                    ak.where(taun_is_dm11, polarimetric_vec_dm11(tau_n_rf, piOS_n_rf, piSS1_n_rf, piSS2_n_rf, pizero_n_rf, -1),
-                                       ak.where(taun_is_leptonic, polarimetric_vec_leptonic(lep_n_rf, bv_taun),
-                                             default)))))
+    taup_s = _leg_polarimetric(taup_dm, tau_p_rf, bv_taup, higgs_bv, piOS_p, piSS1_p, piSS2_p, pizero_p, lep_p, +1)
+    taun_s = _leg_polarimetric(taun_dm, tau_n_rf, bv_taun, higgs_bv, piOS_n, piSS1_n, piSS2_n, pizero_n, lep_n, -1)
 
     return taup_s, spatial(tau_p_rf).unit(), taun_s, spatial(tau_n_rf).unit()
 

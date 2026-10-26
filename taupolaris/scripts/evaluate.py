@@ -3,15 +3,33 @@ import pandas as pd
 import argparse
 import yaml
 import os
+import json
+import time
 import uproot
 import numpy as np
 from tqdm import tqdm
 from taupolaris.python.NN_Tools import load_model, get_device, is_legacy_pizero_proj_checkpoint
 from taupolaris.python.DataProcessing import _resolve_polvec_feature_level, get_test_dataset
 from taupolaris.utils.coordinate_conversions import convert_coordinates_pred
-from taupolaris.python.Evaluation_Tools import flow_map_predict, compute_spin_vars, save_sampled_pdfs, plot_spin_density_matrix
+from taupolaris.python.Evaluation_Tools import flow_map_predict, compute_spin_vars, spin_angles_from_polarimetric, save_sampled_pdfs, plot_spin_density_matrix
 from taupolaris.utils.kinematic_helpers import compute_spin_density_vars, add_energies_pair, add_energy, inv_mass
-from taupolaris.utils.acoplanarity_tools import get_ditau_polarimetric, compute_aco_polarimetric
+from taupolaris.utils.acoplanarity_tools import get_ditau_polarimetric, compute_aco_polarimetric, decay_mode_codes
+
+
+def neutrino_momentum_groups(output_features):
+    """Indices of each neutrino's 3-momentum in output_features, for flow_map_predict's 'stable_gradient':
+    (n, r, k) or (px, py, pz) per prefix, e.g. hadronic ((0,1,2), (3,4,5)), semileptonic ((1,2,3), (4,5,6))
+    (tau1_nu_m comes first there)."""
+    groups = []
+    for comps in (('_n', '_r', '_k'), ('_px', '_py', '_pz')):
+        for i, f in enumerate(output_features):
+            if f.endswith(comps[0]):
+                pre = f[:-len(comps[0])]
+                if all(pre + c in output_features for c in comps):
+                    groups.append(tuple(output_features.index(pre + c) for c in comps))
+    if len(groups) != 2:
+        raise ValueError(f"expected two neutrino 3-momenta in Cartesian-like outputs, got {groups} from {output_features}")
+    return tuple(groups)
 
 
 def circular_std(angles, axis=-1):
@@ -27,31 +45,6 @@ def circular_std(angles, axis=-1):
     return np.sqrt(-2.0 * np.log(R))
 
 
-def _phiCP_dm_codes(df, prefix):
-    """Per-tau decay-mode code (0/1/2/10/11 hadronic, 100 leptonic, -1
-    unmatched), needed by get_ditau_polarimetric. Same convention as
-    plot_phiCP.py's add_DM / evaluate_polvec.py's add_DM. `prefix` is the
-    reconstruction level to classify at ('reco' or 'true'), matching
-    whichever level the pion four-momenta are taken from."""
-    dm = {}
-    for tau in ('taup', 'taun'):
-        is_lep = df[f'{prefix}_{tau}_ishadronic'].values == 0
-        npizero = df[f'{prefix}_{tau}_npizero'].values
-        is3prong = df[f'{prefix}_{tau}_is3prong'].values
-        is_dm0 = (npizero == 0) & (is3prong == 0) & (~is_lep)
-        is_dm1 = (npizero == 1) & (is3prong == 0) & (~is_lep)
-        is_dm2 = ((npizero == 1) | (npizero == 2)) & (is3prong == 0) & (~is_lep)
-        is_dm10 = (npizero == 0) & (is3prong == 1) & (~is_lep)
-        is_dm11 = (npizero == 1) & (is3prong == 1) & (~is_lep)
-        dm[tau] = np.where(is_dm0, 0,
-                    np.where(is_dm1, 1,
-                        np.where(is_dm2, 2,
-                            np.where(is_dm10, 10,
-                                np.where(is_dm11, 11,
-                                    np.where(is_lep, 100, -1))))))
-    return dm['taup'], dm['taun']
-
-
 def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument('--config', '-c', help='path to the configuration file', type=str, default='taupolaris/config/LEP.yaml', required=True)
@@ -62,8 +55,11 @@ def main():
     argparser.add_argument('--threeprong', help='whether to only evaluate on events with at least 1 3-prong tau', action='store_true')
     argparser.add_argument('--make_root_output', help='whether to save the results in a root file as well as a pandas dataframe', action='store_true')
     argparser.add_argument('--inc_significance', help='whether to include the estimate of the neutrino \"significance\"', action='store_true')
-    argparser.add_argument('--inc_phiCP_error', help='whether to compute phiCP from the predicted neutrino (pred_phiCP/map_pred_phiCP) and its per-event uncertainty (pred_phiCP_err) from repeated flow sampling -- the error from the neutrino regression alone, with all visible momenta held fixed. Needs the flow\'s posterior, so has no effect with --useMLP/--useTransformerBaseline.', action='store_true')
+    argparser.add_argument('--inc_phiCP_error', help='whether to compute phiCP from the predicted neutrino (pred_phiCP/map_pred_phiCP) and its per-event uncertainty (pred_phiCP_err) and circular mean (pred_phiCP_circmean) from repeated flow sampling -- the error from the neutrino regression alone, with all visible momenta held fixed. Needs the flow\'s posterior, so has no effect with --useMLP/--useTransformerBaseline.', action='store_true')
     argparser.add_argument('--n_flow_samples_phiCP', type=int, default=50, help='number of flow samples per event used to estimate the phiCP uncertainty (only used with --inc_phiCP_error)')
+    argparser.add_argument('--inc_spin_means', help='with --inc_phiCP_error: also compute the spin projections cos theta_i^+- (i = n, r, k) of every flow sample and store, per event, the mean and RMS about the mean over the samples (samp_mean_<v>, samp_rms_<v>) of the 6 cos theta_i^+-, the 9 products cos theta_i^+ cos theta_j^- (cos{i}_plus_cos{j}_minus) and cos theta_n^+ cos theta_n^- - cos theta_r^+ cos theta_r^- (cosnn_minus_cosrr, with cosk_plus, cosk_minus and cosk_plus_cosk_minus the Higgs vs DY variables of plot_spin_vars.py)', action='store_true')
+    argparser.add_argument('--save_flow_samples', help='with --inc_phiCP_error: save the per-sample phiCP (and, with --inc_spin_means, the 6 cos theta_i^+-) of every event as float32 [n_events, n_flow_samples_phiCP] arrays in <output_dir>/flow_samples/', action='store_true')
+    argparser.add_argument('--max_events', type=int, default=None, help='evaluate only the first max_events events of each test dataset')
     args = argparser.parse_args()
 
     # load config
@@ -141,6 +137,9 @@ def main():
 
         print(f'Evaluating on test dataset {test_dataset_name}')
         print(f'Number of events in test dataset: {len(test_dataset)}')
+        if args.max_events is not None:
+            test_df = test_df.iloc[:args.max_events].reset_index(drop=True)
+            print(f'>> Using only the first {len(test_df)} events')
     
         if 'taup_nu_px' in test_df.columns:
             tau1_prefix = 'taup'
@@ -232,10 +231,13 @@ def main():
         # move X_test and model to device
         X_test, _ = test_dataset[:]
         del _
+        if args.max_events is not None:
+            X_test = X_test[:args.max_events]
         X_test = X_test.to(device)
         model = model.float().to(device)  # nflows' StandardNormal buffer is float64; MPS needs float32
     
         samples_map = None
+        map_time = None   # seconds per event of the MAP search, stored in the sampling timing json
         sample_chunk_size = nn_config.get('chunk_size', 50000 if device.type == 'cpu' else 100000)
         
         if args.useTransformerBaseline or args.useMLP:
@@ -289,10 +291,12 @@ def main():
             # define alternative prediction by taking most probable value from flow, do this by sampling to find MAP estimate
             print("Computing alternative predictions using flow_map_predict...")
             map_method = nn_config.get('map_method', 'latent_zero')
-            print(f">> Method: {map_method} with chunk size {chunk_size}")
+            print(f">> Method: {map_method} with chunk size {chunk_size}" +
+                  (f", momentum_power {nn_config.get('map_momentum_power', 2)}" if map_method.startswith('stable_gradient') else ''))
             # the MAP log p is stored (map_logp) for the methods that return it; for 'gradient' it is the value at the
-            # last Adam step before the final update
-            with_logp = map_method in ('gradient', 'gradient_multistart', 'minuit')
+            # last Adam step before the final update ('stable_gradient': the Cartesian log p, without its 2 log|p| terms)
+            with_logp = map_method in ('gradient', 'stable_gradient', 'gradient_multistart', 'stable_gradient_multistart', 'minuit')
+            t_map = time.perf_counter()
             map_out = flow_map_predict(
                 model, X_test,
                 test_dataset=test_dataset,
@@ -302,7 +306,10 @@ def main():
                 n_steps=nn_config.get('map_n_steps', 200),
                 n_random_starts=nn_config.get('map_n_random_starts', 10),
                 return_log_prob=with_logp,
+                **(dict(momentum_groups=neutrino_momentum_groups(list(output_features)),
+                        momentum_power=nn_config.get('map_momentum_power', 2)) if map_method.startswith('stable_gradient') else {}),
             )
+            map_time = (time.perf_counter() - t_map) / len(X_test)
             samples_map = map_out[1]
             map_logp = map_out[2] if with_logp else None
             samples_map = convert_coordinates_pred(samples_map, **conv_kwargs)
@@ -677,7 +684,7 @@ def main():
                 print(f"Computing phiCP from the predicted neutrino (pion_prefix={pion_prefix}) and its "
                       f"uncertainty from {args.n_flow_samples_phiCP} flow samples/event...")
 
-                results_df['taup_DM'], results_df['taun_DM'] = _phiCP_dm_codes(results_df, pion_prefix)
+                results_df['taup_DM'], results_df['taun_DM'] = decay_mode_codes(results_df, pion_prefix)
 
                 def _phiCP_from_df(df, tau_prefix):
                     R1, P1, R2, P2 = get_ditau_polarimetric(df, tau_prefix=tau_prefix, reco_pions=reco_pions)
@@ -715,6 +722,20 @@ def main():
                 err_chunk_size = max(1, sample_chunk_size // n_fs)
                 n_events = len(results_df)
                 phiCP_err = np.full(n_events, np.nan)
+                phiCP_circmean = np.full(n_events, np.nan)   # atan2(<sin>, <cos>) of the samples: a sample-based point estimate
+                spin_names = [f'cos{i}_{s}' for s in ('plus', 'minus') for i in 'nrk']
+                spin_prod_names = [f'cos{i}_plus_cos{j}_minus' for i in 'nrk' for j in 'nrk']
+                if args.inc_spin_means:
+                    spin_summary = {f'samp_{stat}_{v}': np.full(n_events, np.nan)
+                                    for v in spin_names + spin_prod_names + ['cosnn_minus_cosrr'] for stat in ('mean', 'rms')}
+                if args.save_flow_samples:
+                    samples_dir = f"{output_dir}/flow_samples"
+                    os.makedirs(samples_dir, exist_ok=True)
+                    saved = {v: np.lib.format.open_memmap(f"{samples_dir}/{data_config['test_output_name']}_{v}.npy", mode='w+',
+                                                          dtype=np.float32, shape=(n_events, n_fs))
+                             for v in ['phiCP'] + (spin_names if args.inc_spin_means else [])}
+                timing = {'sampling': 0., 'conversion': 0., 'phiCP': 0., 'spin': 0.}
+                sync = (lambda: torch.cuda.synchronize()) if device.type == 'cuda' else (lambda: None)
                 n_sample_failures = 0
                 for start in tqdm(range(0, n_events, err_chunk_size), desc="Processing chunks (phiCP uncertainty)"):
                     end = min(start + err_chunk_size, n_events)
@@ -727,6 +748,7 @@ def main():
                     # input event, confirmed by retrying the exact same chunk with fresh
                     # random noise. Retry a few times before giving up on the chunk.
                     samples_norm = None
+                    t0 = time.perf_counter()
                     for attempt in range(5):
                         try:
                             with torch.no_grad():
@@ -736,7 +758,12 @@ def main():
                             continue
                     if samples_norm is None:
                         n_sample_failures += 1
+                        if args.save_flow_samples:
+                            for arr in saved.values():
+                                arr[start:end] = np.nan
                         continue
+                    sync()
+                    t1 = time.perf_counter()
 
                     samples = test_dataset.destandardize_outputs(samples_norm).cpu().numpy().reshape(C * n_fs, -1)
 
@@ -760,15 +787,60 @@ def main():
                     tmp_df['samp_tau_minus_E'],  tmp_df['samp_tau_minus_px'] = tau_minus_samp[:, 0], tau_minus_samp[:, 1]
                     tmp_df['samp_tau_minus_py'], tmp_df['samp_tau_minus_pz'] = tau_minus_samp[:, 2], tau_minus_samp[:, 3]
 
-                    phiCP_samples = _phiCP_from_df(tmp_df, 'samp').reshape(C, n_fs)
+                    # the polarimetric vectors of each sample, once, for both its phiCP and its spin projections
+                    t2 = time.perf_counter()
+                    polvecs = get_ditau_polarimetric(tmp_df, tau_prefix='samp', reco_pions=reco_pions, verbose=False)
+                    phiCP_samples = np.asarray(compute_aco_polarimetric(*polvecs)).reshape(C, n_fs)
                     phiCP_err[start:end] = circular_std(phiCP_samples, axis=1)
+                    phiCP_circmean[start:end] = np.arctan2(np.sin(phiCP_samples).mean(1), np.cos(phiCP_samples).mean(1)) % (2 * np.pi)
+                    t3 = time.perf_counter()
+                    timing['sampling'] += t1 - t0
+                    timing['conversion'] += t2 - t1
+                    timing['phiCP'] += t3 - t2
+                    if args.save_flow_samples:
+                        saved['phiCP'][start:end] = phiCP_samples
+
+                    if args.inc_spin_means:
+                        spin_angles = spin_angles_from_polarimetric(*polvecs)[0]
+                        cos = {v: spin_angles[v].reshape(C, n_fs) for v in spin_names}
+                        per_sample = dict(cos)
+                        for i in 'nrk':
+                            for j in 'nrk':
+                                per_sample[f'cos{i}_plus_cos{j}_minus'] = cos[f'cos{i}_plus'] * cos[f'cos{j}_minus']
+                        per_sample['cosnn_minus_cosrr'] = per_sample['cosn_plus_cosn_minus'] - per_sample['cosr_plus_cosr_minus']
+                        for v, vals in per_sample.items():
+                            # nan-safe: a rare sample has an undefined spin axis (NaN cosine)
+                            spin_summary[f'samp_mean_{v}'][start:end] = np.nanmean(vals, 1)
+                            spin_summary[f'samp_rms_{v}'][start:end] = np.nanstd(vals, 1)
+                        if args.save_flow_samples:
+                            for v in spin_names:
+                                saved[v][start:end] = cos[v]
+                        timing['spin'] += time.perf_counter() - t3
 
                 if n_sample_failures > 0:
                     print(f"  WARNING: flow sampling failed on 5 retries for {n_sample_failures} chunk(s) "
                           f"({n_sample_failures * err_chunk_size} events, upper bound); phiCP_err set to NaN for those events.")
 
                 results_df['pred_phiCP_err'] = phiCP_err
-                del pion_vals_full, dm_vals_full, taup_charged_full, taup_pi0_full, taun_charged_full, taun_pi0_full, phiCP_err
+                results_df['pred_phiCP_circmean'] = phiCP_circmean
+                if args.inc_spin_means:
+                    for col, arr in spin_summary.items():
+                        results_df[col] = arr
+                    del spin_summary
+                if args.save_flow_samples:
+                    for arr in saved.values():
+                        arr.flush()
+                    del saved
+                # time per event in each step of the sampling loop (seconds; 'sampling' is the flow, 'conversion' the
+                # coordinate conversion and the per-sample dataframe)
+                timing = {k: v / n_events for k, v in timing.items()}
+                timing.update(map=map_time, map_method=nn_config.get('map_method', 'latent_zero'), n_events=n_events, n_flow_samples=n_fs, device=str(device),
+                              threads=torch.get_num_threads(), host=os.uname().nodename,
+                              gpu=torch.cuda.get_device_name() if device.type == 'cuda' else None)
+                print(f"  time per event: " + ", ".join(f"{k} {timing[k] * 1e3:.2f} ms" for k in ('sampling', 'conversion', 'phiCP', 'spin')))
+                with open(f"{output_dir}/{data_config['test_output_name']}_sampling_timing.json", 'w') as f:
+                    json.dump(timing, f, indent=1)
+                del pion_vals_full, dm_vals_full, taup_charged_full, taup_pi0_full, taun_charged_full, taun_pi0_full, phiCP_err, phiCP_circmean
 
         # write the results dataframe to a parquet file
         results_df.to_parquet(f"{output_dir}/{data_config['test_output_name']}.parquet")
