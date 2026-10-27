@@ -282,12 +282,16 @@ def get_R_P_vectors_all(df, tau_prefix='tau', use_map=True):
     return R, P, is_dm1dm2
 
 def compute_aco_polarimetric(R1, P1, R2, P2):
-    R1perp = R1 - ((R1.dot(P1)) / (P1.dot(P1))) * P1
-    R2perp = R2 - ((R2.dot(P2)) / (P2.dot(P2))) * P2
-    angle = np.arccos((R1perp.unit()).dot(R2perp.unit()))
-    sign = (P2.unit()).dot((R1perp.unit()).cross(R2perp.unit()))
-    angle = ak.where(sign >= 0, angle, 2 * np.pi - angle)
-    return angle
+    """Signed phiCP in [0, 2pi) (numpy array) from the polarimetric vectors R1, R2 and tau directions P1, P2
+    (Vector3D-like, with .x/.y/.z)."""
+    R1, P1, R2, P2 = (np.column_stack([np.asarray(v.x), np.asarray(v.y), np.asarray(v.z)]) for v in (R1, P1, R2, P2))
+    dot = lambda a, b: (a * b).sum(1)
+    R1perp = R1 - (dot(R1, P1) / dot(P1, P1))[:, None] * P1
+    R2perp = R2 - (dot(R2, P2) / dot(P2, P2))[:, None] * P2
+    u1, u2 = _unit(R1perp), _unit(R2perp)
+    angle = np.arccos(dot(u1, u2))
+    sign = dot(_unit(P2), np.cross(u1, u2))
+    return np.where(sign >= 0, angle, 2 * np.pi - angle)
 
 def compute_aco_classic(R1, P1, R2, P2, leg1_is_dp, leg2_is_dp):
     """Compute the acoplanarity angle using the calculated R and P vectors, with shifts for meson polarisation with decay plane"""
@@ -381,28 +385,83 @@ def decay_mode_codes(df, prefix):
     return dm[0], dm[1]
 
 
-def _p4(df, prefix):
-    # from the numpy columns: ak.zip of pandas Series goes through ak.from_iter, a Python loop over the rows
-    return ak.zip({c: df[f"{prefix}_{c}"].values for c in ("px", "py", "pz", "E")}, with_name="Momentum4D")
+# get_ditau_polarimetric's kinematics in plain numpy, on (N, 4) [px, py, pz, E] arrays: the same formulas as the
+# awkward/vector polarimetric_vec_* above, without their fixed cost per operation (~15 ms per boost of an awkward
+# record array, which made a call cost ~0.6 s whatever its size)
+
+class _P4:
+    """.E/.px/.py/.pz views of an (N, 4) [px, py, pz, E] array, the interface PolarimetricA1_vectorised and
+    Polarimetric3hpi0_vectorised read their inputs through."""
+    def __init__(self, v):
+        self.px, self.py, self.pz, self.E = v[:, 0], v[:, 1], v[:, 2], v[:, 3]
 
 
-def _leg_polarimetric(dm, tau_rf, bv_tau, higgs_bv, piOS, piSS1, piSS2, pizero, lep, taucharge):
-    """Polarimetric vector of one tau leg (tau rest frame reached from the ditau rest frame), with the formula of each
-    decay mode evaluated only on the rows of that mode; -9999 for rows of no known mode. The decay products are given
-    in the lab frame and boosted to the ditau rest frame (higgs_bv) only on the rows that use them."""
+def _p4np(df, prefix):
+    return np.column_stack([df[f"{prefix}_{c}"].values for c in ("px", "py", "pz", "E")]).astype(np.float64)
+
+
+def _boost_np(v, b):
+    """ROOT TLorentzVector::Boost(b) (vector's v.boost(b)) of (N, 4) [px, py, pz, E] arrays by velocities b (N, 3)."""
+    b2 = (b * b).sum(1)
+    gamma = 1.0 / np.sqrt(1.0 - b2)
+    bp = (b * v[:, :3]).sum(1)
+    gamma2 = np.where(b2 > 0, (gamma - 1.0) / np.where(b2 > 0, b2, 1.0), 0.0)
+    p = v[:, :3] + (gamma2 * bp + gamma * v[:, 3])[:, None] * b
+    return np.column_stack([p, gamma * (v[:, 3] + bp)])
+
+
+def _rest(v, bv):
+    # into the frame moving with velocity bv, as boost4(v, bv)
+    return _boost_np(v, -bv)
+
+
+def _bv(v):
+    return v[:, :3] / v[:, 3:4]
+
+
+def _mdot(a, b):
+    return a[:, 3] * b[:, 3] - (a[:, :3] * b[:, :3]).sum(1)
+
+
+def _unit(x):
+    return x / np.linalg.norm(x, axis=1, keepdims=True)
+
+
+def _polvec_np(dm, tau_rf, bv_tau, higgs_bv, piOS, piSS1, piSS2, pizero, lep, taucharge):
+    """Polarimetric vector of one tau leg, (N, 3), in its rest frame reached from the ditau rest frame: each decay-mode
+    formula evaluated on the rows of that mode only, -9999 for rows of no known mode. The decay products are given in
+    the lab frame."""
     out = np.full((len(dm), 3), -9999.0)
-    modes = (
-        (dm == 0,             lambda m, rf: polarimetric_vec_dm0(rf(piOS), bv_tau[m])),
-        (np.isin(dm, (1, 2)), lambda m, rf: polarimetric_vec_dm1(rf(piOS), rf(pizero), tau_rf[m], bv_tau[m])),
-        (dm == 10,            lambda m, rf: polarimetric_vec_dm10(tau_rf[m], rf(piOS), rf(piSS1), rf(piSS2), taucharge)),
-        (dm == 11,            lambda m, rf: polarimetric_vec_dm11(tau_rf[m], rf(piOS), rf(piSS1), rf(piSS2), rf(pizero), taucharge)),
-        (dm == 100,           lambda m, rf: polarimetric_vec_leptonic(rf(lep), bv_tau[m])),
-    )
-    for mask, polvec in modes:
-        if mask.any():
-            pv = polvec(mask, lambda v, m=mask: boost4(v[m], higgs_bv[m]))
-            out[mask] = np.stack([ak.to_numpy(pv.x), ak.to_numpy(pv.y), ak.to_numpy(pv.z)], axis=1)
-    return ak.zip({"x": out[:, 0], "y": out[:, 1], "z": out[:, 2]}, with_name="Vector3D")
+    for mode, mask in ((0, dm == 0), (1, np.isin(dm, (1, 2))), (10, dm == 10), (11, dm == 11), (100, dm == 100)):
+        if not mask.any():
+            continue
+        rf = lambda v: _rest(v[mask], higgs_bv[mask])
+        tau, bv = tau_rf[mask], bv_tau[mask]
+        if mode == 0:
+            pv = _unit(_rest(rf(piOS), bv)[:, :3])
+        elif mode == 1:
+            pi, piz = rf(piOS), rf(pizero)
+            q, N = pi - piz, tau - pi - piz
+            qN, qP, NP, q2 = _mdot(q, N), _mdot(q, tau), _mdot(N, tau), _mdot(q, q)
+            coeff = np.sqrt(np.maximum(_mdot(tau, tau), 0.0)) / (2 * qN * qP - q2 * NP)
+            pv = _unit(_rest(coeff[:, None] * (2 * qN[:, None] * q - q2[:, None] * N), bv)[:, :3])
+        elif mode == 100:
+            pv = _unit(-_rest(rf(lep), bv)[:, :3])
+        else:
+            # a1 (DM 10) and 3h+pi0 (DM 11) currents, in the tau rest frame (sign reversed by convention)
+            trf = lambda v: _P4(_rest(v, bv))
+            if mode == 10:
+                h = PolarimetricA1_vectorised(trf(tau), trf(rf(piOS)), trf(rf(piSS1)), trf(rf(piSS2)), taucharge).PVC()
+            else:
+                h = Polarimetric3hpi0_vectorised(trf(tau), trf(rf(piOS)), trf(rf(piSS1)), trf(rf(piSS2)), trf(rf(pizero)),
+                                                 taucharge).PVC()
+            pv = _unit(-np.column_stack([np.asarray(h.x), np.asarray(h.y), np.asarray(h.z)]))
+        out[mask] = pv
+    return out
+
+
+def _vec3(x):
+    return ak.zip({"x": x[:, 0], "y": x[:, 1], "z": x[:, 2]}, with_name="Vector3D")
 
 
 def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=True, dm=None, verbose=True):
@@ -412,7 +471,8 @@ def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=Tr
     add_ghosts: whether to add a "ghost" particle with small momentum to taus to handel cases where neutrinos are predicted to have zero momentum which causes issues for the polarimetric vector calculation. 
     dm: optional (taup DM, taun DM) arrays to use instead of df["taup_DM"], df["taun_DM"]
     Returns the polarimetric vectors of the tau+ and tau- (each in its rest frame, reached from the ditau rest frame)
-    and the unit tau+ and tau- directions in the ditau rest frame: h+, k+, h-, k-.
+    and the unit tau+ and tau- directions in the ditau rest frame: h+, k+, h-, k- (awkward Vector3D; h = -9999 for
+    legs of no known decay mode).
     """
 
     # Get R and P (polarimetric vector edition)
@@ -434,47 +494,30 @@ def get_ditau_polarimetric(df, tau_prefix='true', reco_pions=True, add_ghosts=Tr
 
     taup_dm, taun_dm = (df["taup_DM"].values, df["taun_DM"].values) if dm is None else (np.asarray(dm[0]), np.asarray(dm[1]))
 
-    # Tau plus decay products (pi1 is only actually OS in the 3 prong case), and the tau plus
-    piOS_p, piSS1_p, piSS2_p = (_p4(df, f"{pion_prefix}_taup_{p}") for p in ("pi1", "pi2", "pi3"))
-    pizero_p = _p4(df, f"{pion_prefix}_taup_pizero1")
-    lep_p = _p4(df, f"{pion_prefix}_taup_charged")
-    tau_p = _p4(df, f"{tau_prefix}_tau_plus")
-
-    # Tau minus decay products, and the tau minus
-    piOS_n, piSS1_n, piSS2_n = (_p4(df, f"{pion_prefix}_taun_{p}") for p in ("pi1", "pi2", "pi3"))
-    pizero_n = _p4(df, f"{pion_prefix}_taun_pizero1")
-    lep_n = _p4(df, f"{pion_prefix}_taun_charged")
-    tau_n = _p4(df, f"{tau_prefix}_tau_minus")
+    # the taus and, per tau, its decay products (pi1 is only actually OS in the 3 prong case)
+    tau = {"p": _p4np(df, f"{tau_prefix}_tau_plus"), "n": _p4np(df, f"{tau_prefix}_tau_minus")}
+    vis = {leg: [_p4np(df, f"{pion_prefix}_tau{leg}_{part}") for part in ("pi1", "pi2", "pi3", "pizero1", "charged")]
+           for leg in ("p", "n")}
 
     if add_ghosts:
         # add small "ghost" particle to the taus to handle cases where the tau momentum is exactly equal to the visible momentum (i.e when neutrino was estimated to have exactly zero momentum)
         # ghosts will be in the same direction as the tau and have total p=E=epsilon
         epsilon = 1e-3
-        tau_p_pmag = np.sqrt(tau_p.px**2 + tau_p.py**2 + tau_p.pz**2)
-        tau_n_pmag = np.sqrt(tau_n.px**2 + tau_n.py**2 + tau_n.pz**2)
-        tau_p_unit = ak.zip({"x": tau_p.px / tau_p_pmag, "y": tau_p.py / tau_p_pmag, "z": tau_p.pz / tau_p_pmag}, with_name="Vector3D")
-        tau_n_unit = ak.zip({"x": tau_n.px / tau_n_pmag, "y": tau_n.py / tau_n_pmag, "z": tau_n.pz / tau_n_pmag}, with_name="Vector3D")
-        ghost_p = ak.zip({"px": tau_p_unit.x * epsilon, "py": tau_p_unit.y * epsilon, "pz": tau_p_unit.z * epsilon, "E": ak.full_like(tau_p.E, epsilon)}, with_name="Momentum4D")
-        ghost_n = ak.zip({"px": tau_n_unit.x * epsilon, "py": tau_n_unit.y * epsilon, "pz": tau_n_unit.z * epsilon, "E": ak.full_like(tau_n.E, epsilon)}, with_name="Momentum4D")
-        tau_p = tau_p + ghost_p
-        tau_n = tau_n + ghost_n
+        for leg in ("p", "n"):
+            t = tau[leg]
+            ghost = np.column_stack([t[:, :3] / np.linalg.norm(t[:, :3], axis=1, keepdims=True) * epsilon,
+                                     np.full(len(t), epsilon)])
+            tau[leg] = t + ghost
 
-    # Higgs rest frame boost vectors
-    higgs_bv = boost_vec(tau_p + tau_n)
-
-    # Boost the taus to the Higgs rest frame (their decay products are boosted in _leg_polarimetric)
-    tau_p_rf = boost4(tau_p, higgs_bv)
-    tau_n_rf = boost4(tau_n, higgs_bv)
-
-    # Tau rest frame boost vectors (from Higgs rest frame)
-    bv_taup = boost_vec(tau_p_rf)
-    bv_taun = boost_vec(tau_n_rf)
+    # Higgs rest frame boost vector, the taus in the Higgs rest frame and their boost vectors from it
+    higgs_bv = _bv(tau["p"] + tau["n"])
+    tau_rf = {leg: _rest(tau[leg], higgs_bv) for leg in ("p", "n")}
 
     # Get the polarimetric vectors
-    taup_s = _leg_polarimetric(taup_dm, tau_p_rf, bv_taup, higgs_bv, piOS_p, piSS1_p, piSS2_p, pizero_p, lep_p, +1)
-    taun_s = _leg_polarimetric(taun_dm, tau_n_rf, bv_taun, higgs_bv, piOS_n, piSS1_n, piSS2_n, pizero_n, lep_n, -1)
+    h = {leg: _polvec_np(dmc, tau_rf[leg], _bv(tau_rf[leg]), higgs_bv, *vis[leg], charge)
+         for leg, dmc, charge in (("p", taup_dm, +1), ("n", taun_dm, -1))}
 
-    return taup_s, spatial(tau_p_rf).unit(), taun_s, spatial(tau_n_rf).unit()
+    return (_vec3(h["p"]), _vec3(_unit(tau_rf["p"][:, :3])), _vec3(h["n"]), _vec3(_unit(tau_rf["n"][:, :3])))
 
 
 def hadronic_current_features(piOS, piSS1, piSS2, pizero, dm, prefix='', eps=1e-12):
